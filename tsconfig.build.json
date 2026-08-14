@@ -1,0 +1,13 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"outDir": "app/js",
+		"declaration": false,
+		"sourceMap": false,
+		"inlineSourceMap": false,
+		"declarationMap": false,
+		"removeComments": false
+	},
+	"exclude": ["tests"]
+}
