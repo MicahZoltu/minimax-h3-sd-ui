@@ -1,12 +1,32 @@
 import { describe, it, expect } from "bun:test";
-import { createHistoryStore, type SyncStorage } from "../app/ts/history.js";
-import type { HistoryItem } from "../app/ts/types.js";
+import { createHistoryStore, createQueuePersistence, estimateStorage, isHistoryItem, type HistoryBackend, type SyncStorage } from "../app/ts/history.js";
+import type { HistoryItem, QueueItem } from "../app/ts/types.js";
+
+function makeQueueItem(partial: Partial<QueueItem> = {}): QueueItem {
+	return {
+		id: "q_" + Math.random().toString(36).slice(2),
+		status: "queued",
+		prompt: "a dog",
+		zipName: null,
+		mode: "prompt",
+		files: [],
+		width: 640,
+		height: 384,
+		jobFrames: 49,
+		steps: 20,
+		error: null,
+		serverId: null,
+		startedAt: null,
+		...partial,
+	};
+}
 
 function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 	return {
 		id: "h_" + Math.random().toString(36).slice(2),
 		createdAt: Date.now(),
 		prompt: "test",
+		zipName: null,
 		mode: "prompt",
 		files: [],
 		width: 512,
@@ -45,10 +65,107 @@ function memoryStorage(limitBytes = Infinity): SyncStorage {
 	};
 }
 
-// (byte budget is computed inline in the quota tests above)
+function memoryBackend(): HistoryBackend & { data(): HistoryItem[] } {
+	const data: HistoryItem[] = [];
+	return {
+		isPersistent: () => true,
+		async loadAll() {
+			return data.map((i) => ({ ...i, persisted: true }));
+		},
+		async save(item) {
+			data.push(item);
+		},
+		async remove(id) {
+			const i = data.findIndex((x) => x.id === id);
+			if (i >= 0) data.splice(i, 1);
+		},
+		async clear() {
+			data.length = 0;
+		},
+		data: () => data,
+	};
+}
+
+// A backend that, like the real IndexedDB backend, validates its raw entries before exposing them.
+function validatingBackend(): HistoryBackend & { setData(entries: unknown[]): void } {
+	let data: unknown[] = [];
+	return {
+		isPersistent: () => true,
+		async loadAll() {
+			const out: HistoryItem[] = [];
+			for (const entry of data) {
+				if (isHistoryItem(entry)) {
+					entry.persisted = true;
+					out.push(entry);
+				}
+			}
+			return out;
+		},
+		async save() {},
+		async remove() {},
+		async clear() {},
+		setData(entries: unknown[]) {
+			data = entries;
+		},
+	};
+}
+
+const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+describe("createQueuePersistence", () => {
+	it("round-trips a queue through a fake storage", () => {
+		const storage = memoryStorage();
+		const save = createQueuePersistence(storage);
+		const queue = [makeQueueItem(), makeQueueItem({ status: "generating", serverId: "srv" })];
+		save.save(queue);
+
+		const load = createQueuePersistence(storage);
+		const loaded = load.load();
+		expect(loaded.length).toBe(2);
+		expect(loaded[0]?.id).toBe(queue[0]?.id);
+		expect(loaded[0]?.prompt).toBe("a dog");
+		expect(loaded[1]?.id).toBe(queue[1]?.id);
+		expect(loaded[1]?.status).toBe("generating");
+		expect(loaded[1]?.serverId).toBe("srv");
+	});
+
+	it("rejects garbage payloads by returning an empty queue", () => {
+		const storage = memoryStorage();
+		storage.setItem("sdcpp.video.queue", "{not json");
+		expect(createQueuePersistence(storage).load()).toEqual([]);
+
+		storage.setItem("sdcpp.video.queue", JSON.stringify({ id: "x" }));
+		expect(createQueuePersistence(storage).load()).toEqual([]);
+
+		storage.setItem("sdcpp.video.queue", JSON.stringify([{ id: "x" }]));
+		expect(createQueuePersistence(storage).load()).toEqual([]);
+	});
+
+	it("strips items missing required fields from a mixed payload", () => {
+		const storage = memoryStorage();
+		const good = makeQueueItem();
+		storage.setItem("sdcpp.video.queue", JSON.stringify([good, { id: "bad" }]));
+		const loaded = createQueuePersistence(storage).load();
+		expect(loaded.length).toBe(1);
+		expect(loaded[0]?.id).toBe(good.id);
+	});
+
+	it("no-ops when there is no storage", () => {
+		const queuePersistence = createQueuePersistence(null);
+		expect(queuePersistence.load()).toEqual([]);
+		expect(() => queuePersistence.save([makeQueueItem()])).not.toThrow();
+	});
+});
+
+describe("estimateStorage", () => {
+	it("does not throw and returns null without a storage backend", async () => {
+		const estimate = await estimateStorage();
+		expect(estimate).toBe(null);
+	});
+});
 
 describe("createHistoryStore", () => {
-	it("keeps items purely in memory when no storage is available", () => {
+	it("keeps items purely in memory when no backend is available", () => {
 		const store = createHistoryStore(null);
 		expect(store.isPersistent()).toBe(false);
 		store.add(makeItem());
@@ -57,88 +174,103 @@ describe("createHistoryStore", () => {
 		expect(store.items().every((i) => i.persisted === false)).toBe(true);
 	});
 
-	it("persists items and reloads them into a new store", () => {
-		const storage = memoryStorage();
-		const first = createHistoryStore(storage);
+	it("persists an added item to the backend and marks it persisted", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const item = makeItem();
+		store.add(item);
+		expect(item.persisted).toBe(false);
+		await flush();
+		expect(item.persisted).toBe(true);
+		expect(backend.data().some((i) => i.id === item.id)).toBe(true);
+	});
+
+	it("rehydrates persisted history into a new store via load()", async () => {
+		const backend = memoryBackend();
+		const first = createHistoryStore(backend);
 		const item = makeItem();
 		first.add(item);
-		expect(item.persisted).toBe(true);
+		await flush();
 
-		const second = createHistoryStore(storage);
+		const second = createHistoryStore(backend);
+		await second.load();
 		expect(second.items().length).toBe(1);
 		expect(second.items()[0]?.id).toBe(item.id);
 		expect(second.items()[0]?.prompt).toBe("test");
 		expect(second.items()[0]?.persisted).toBe(true);
 	});
 
-	it("removes an item from memory and storage", () => {
-		const storage = memoryStorage();
-		const store = createHistoryStore(storage);
+	it("removes an item from memory and the backend", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
 		const a = makeItem();
 		const b = makeItem();
 		store.add(a);
 		store.add(b);
+		await flush();
+
 		store.remove(a.id);
 		expect(store.items().map((i) => i.id)).toEqual([b.id]);
-		const reloaded = createHistoryStore(storage);
+
+		const reloaded = createHistoryStore(backend);
+		await reloaded.load();
 		expect(reloaded.items().map((i) => i.id)).toEqual([b.id]);
+		expect(backend.data().length).toBe(1);
 	});
 
-	it("evicts the oldest persisted item on quota pressure", () => {
-		// Budget sized to fit roughly one item plus modest overhead.
-		const oneSize = JSON.stringify(makeItem()).length + 10;
-		const storage = memoryStorage(oneSize);
-		const store = createHistoryStore(storage);
-		const x = makeItem({ createdAt: 1 });
-		const y = makeItem({ createdAt: 2 });
-		store.add(x);
-		store.add(y);
-		// The oldest (x) is dropped from storage (kept in memory) to fit y.
-		expect(store.items().map((i) => i.id)).toEqual([x.id, y.id]);
-		expect(x.persisted).toBe(false);
-		expect(y.persisted).toBe(true);
-		expect(storage.getItem("sdcpp.video.history.item." + x.id)).toBe(null);
+	it("removeOldest removes the N oldest items", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const items = [makeItem({ createdAt: 1 }), makeItem({ createdAt: 2 }), makeItem({ createdAt: 3 }), makeItem({ createdAt: 4 })];
+		for (const i of items) store.add(i);
+		await flush();
+
+		store.removeOldest(2);
+		expect(store.items().map((i) => i.id)).toEqual([items[2]?.id ?? "", items[3]?.id ?? ""]);
+		expect(backend.data().length).toBe(2);
 	});
 
-	it("falls back to in-memory only when a single item exceeds quota", () => {
-		const storage = memoryStorage(40);
-		const store = createHistoryStore(storage);
-		const big = makeItem();
-		big.video.b64 = "x".repeat(5000);
-		store.add(big);
+	it("removeOldest ignores a non-positive count", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const a = makeItem({ createdAt: 1 });
+		store.add(a);
+		await flush();
+		store.removeOldest(0);
+		store.removeOldest(-3);
+		expect(store.items().map((i) => i.id)).toEqual([a.id]);
+	});
+
+	it("clear removes every item from memory and the backend", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		store.add(makeItem({ createdAt: 1 }));
+		store.add(makeItem({ createdAt: 2 }));
+		await flush();
+
+		store.clear();
+		expect(store.items().length).toBe(0);
+		expect(backend.data().length).toBe(0);
+
+		const reloaded = createHistoryStore(backend);
+		await reloaded.load();
+		expect(reloaded.items().length).toBe(0);
+	});
+
+	it("load filters out invalid persisted entries", async () => {
+		const backend = validatingBackend();
+		const validItem = makeItem();
+		backend.setData([validItem, { id: "bad" }]);
+
+		const store = createHistoryStore(backend);
+		await store.load();
 		expect(store.items().length).toBe(1);
-		expect(big.persisted).toBe(false);
+		expect(store.items()[0]?.id).toBe(validItem.id);
 	});
 
 	it("bounds in-memory growth to MAX_IN_MEMORY", () => {
 		const store = createHistoryStore(null);
 		for (let i = 0; i < 105; i++) store.add(makeItem({ createdAt: i }));
 		expect(store.items().length).toBe(100);
-		expect(store.items()[0]?.createdAt).toBe(5);
-	});
-
-	it("handles a corrupt persisted payload gracefully", () => {
-		const storage = memoryStorage();
-		storage.setItem("sdcpp.video.history.item.h_bad", "{not json");
-		const store = createHistoryStore(storage);
-		expect(store.items().length).toBe(0);
-	});
-
-	it("does not throw when storage throws inside calls", () => {
-		const failing: SyncStorage = {
-			getItem: () => {
-				throw new Error("blocked");
-			},
-			setItem: () => {
-				throw new Error("blocked");
-			},
-			removeItem: () => {
-				throw new Error("blocked");
-			},
-			keys: () => [],
-		};
-		const store = createHistoryStore(failing);
-		expect(() => store.add(makeItem())).not.toThrow();
-		expect(store.items().length).toBe(1);
 	});
 });

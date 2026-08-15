@@ -29,7 +29,10 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
   Failed/cancelled items and completed history rows are not reorderable.
   Each item's prompt and input images are viewable.
 - Completed history items show elapsed time, final frame count, and dimensions; each opens a detail view to download the video, the regenerated source zip, and the input files.
-- History persists to `localStorage` when available and degrades gracefully to in-memory in private browsing / on storage quota pressure.
+- The queue and in-progress generation persist to `localStorage`, and completed history (including full video + input-file data) persists to **IndexedDB**, which has far larger quota than the ~5 MB `localStorage` cap (a single webm routinely exceeds it, which is why history used to vanish on refresh).
+  Everything degrades gracefully to in-memory in private browsing when storage is unavailable.
+- After a page refresh, queued items, the currently generating item, and completed history are all restored; the running job resumes by re-polling its saved server id (it degrades to a "generation lost due to page refresh" note if the server no longer has the job).
+- Storage usage is tracked visibly in the header, with controls to delete a single history item, delete the oldest `n` generations, or clear all saved history (the currently generating item cannot be deleted).
 
 The new-job form sets **width, height, frames (default 107), and steps (default 20)**.
 Remaining parameters are fixed (fps 24, cfg 1, distilled guidance 3.5) and are not shown in the UI.
@@ -85,7 +88,7 @@ Memory safety: each zip entry's declared uncompressed size is checked before inf
 
 **Security invariants.** No `innerHTML`/`eval`/`outerHTML` — DOM is built via a hyperscript helper that inserts text with `createTextNode` and sets attributes via `setAttribute`/`.value`, so prompts and file names cannot inject markup.
 The API host is configurable and the page contacts only it (a `referrer no-referrer` meta; no CDNs/fonts/analytics).
-All access to `localStorage` is wrapped in try/catch, degrading to in-memory (session-only) history in private browsing or on quota pressure.
+All access to `localStorage` and `IndexedDB` is wrapped in try/catch and best-effort, degrading to in-memory (session-only) history in private browsing or on quota pressure.
 
 ## Interesting files
 

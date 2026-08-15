@@ -2,15 +2,17 @@
 // The UI is small and deliberately simple: render functions rebuild section containers from the store, and a single event delegation handler routes user actions.
 // No markup is ever built from unescaped strings, so uploaded prompts / file names are always safe.
 
-import { analyzeZip, buildSourceZip } from "./zip.js";
-import { h, clear, type Child } from "./dom.js";
-import { downloadFile, downloadVideo } from "./download.js";
 import { getConfigurableBase } from "./config.js";
+import { h, clear, type Child } from "./dom.js";
+import { downloadDataUrl } from "./download.js";
+import { setupFavicon } from "./favicon.js";
+import { estimateStorage } from "./history.js";
 import { pump } from "./queue.js";
 import type { Store } from "./state.js";
 import { FALLBACK_DIMS } from "./state.js";
 import type { HistoryItem, QueueItem } from "./types.js";
-import { dataUrlToBytes, formatElapsed, uid } from "./utils.js";
+import { dataUrlToBytes, formatElapsed, sanitizeBasename, uid } from "./utils.js";
+import { analyzeZip, buildSourceZip } from "./zip.js";
 
 const isHTMLElement = (el: unknown): el is HTMLElement => el instanceof HTMLElement;
 const isInputElement = (el: unknown): el is HTMLInputElement => el instanceof HTMLInputElement;
@@ -25,25 +27,164 @@ function maybeElement<T extends Element>(el: unknown, guard: (el: unknown) => el
 	return guard(el) ? el : null;
 }
 
+function formatBytes(n: number): string {
+	if (!Number.isFinite(n) || n < 0) return "0 B";
+	if (n < 1024) return `${Math.round(n)} B`;
+	const units = ["KB", "MB", "GB", "TB"];
+	let value = n;
+	let unit = "KB";
+	for (const u of units) {
+		value /= 1024;
+		unit = u;
+		if (value < 1024) break;
+	}
+	const hasFraction = value < 10 && Math.floor(value) !== value;
+	return `${hasFraction ? value.toFixed(1) : Math.round(value)} ${unit}`;
+}
+
 export function mount(store: Store, root: HTMLElement): void {
 	let lastHistorySig = "";
-	let lastSelectedId: string | null = null;
 	let lastFormRev = -1;
 	let lastQueueRev = -1;
+
+	let storageModalOpen = false;
+	let lastEstimate: { usage: number; quota: number } | null = null;
+	let storageMeterRefreshing = false;
+	const refreshStorageMeter = async (): Promise<void> => {
+		if (storageMeterRefreshing) return;
+		storageMeterRefreshing = true;
+		try {
+			const estimate = await estimateStorage();
+			lastEstimate = estimate ? { usage: estimate.usage, quota: estimate.quota } : null;
+			if (store.history.isPersistent() && estimate && estimate.quota > 0) {
+				const pct = Math.min(100, Math.round((estimate.usage / estimate.quota) * 1000) / 10);
+				storageTextEl.textContent = `${formatBytes(estimate.usage)} / ${formatBytes(estimate.quota)}`;
+				storageFillEl.style.width = pct + "%";
+				storageBarEl.style.display = "";
+			} else {
+				storageTextEl.textContent = "session-only history";
+				storageFillEl.style.width = "0%";
+				storageBarEl.style.display = "none";
+			}
+			if (storageModalOpen) renderStorageModal();
+		} finally {
+			storageMeterRefreshing = false;
+		}
+	};
+	const renderStorageModal = (): void => {
+		clear(storageRootEl);
+		if (!storageModalOpen) {
+			storageRootEl.style.display = "none";
+			return;
+		}
+		storageRootEl.style.display = "block";
+		const usage = lastEstimate?.usage ?? 0;
+		const quota = lastEstimate?.quota ?? 0;
+		const items = store.history.items();
+		const slices = items.map((it, index) => ({
+			label: it.prompt,
+			value: historyItemBytes(it),
+			color: PIE_COLORS[index % PIE_COLORS.length] ?? PIE_COLORS[0] ?? "#5b8cff",
+		}));
+		const persistent = store.history.isPersistent();
+		const canvas = document.createElement("canvas");
+		canvas.className = "storage-pie";
+		const overlay = h("div", { class: "overlay storage-overlay" }, [
+			h("div", { class: "modal storage-modal" }, [
+				h("div", { class: "modal-head" }, [
+					h("h2", {}, "Storage"),
+					h("button", { class: "btn", "data-action": "close-storage" }, "Close"),
+				]),
+				canvas,
+				h("p", { class: "storage-summary" }, persistent ? `history saved in this browser · ${formatBytes(usage)} of ${formatBytes(quota)}` : "session-only history (not persisted)"),
+				h("div", { class: "storage-delete-oldest" }, [
+					h("label", { class: "storage-del-label" }, "Delete oldest history"),
+					h("div", { class: "storage-del-row" }, [
+						h("input", { type: "number", min: "1", value: "1", "data-delete-oldest-count": "", "aria-label": "How many oldest history items to delete" }),
+						h("button", { class: "btn small", "data-action": "delete-oldest" }, "Delete oldest"),
+					]),
+				]),
+				h("div", { class: "modal-actions" }, [
+					h("button", { class: "btn small danger", "data-action": "clear-history" }, "Clear all history"),
+				]),
+			]),
+		]);
+		storageRootEl.appendChild(overlay);
+		drawStoragePie(canvas, slices, usage, quota);
+	};
 
 	const header = buildHeader();
 	const statusEl = requiredElement(header.querySelector(".status"), isHTMLElement, "status");
 	const storageEl = requiredElement(header.querySelector(".storage-note"), isHTMLElement, "storage note");
-	const apiInput = maybeElement(header.querySelector("#apiBase"), isInputElement);
-	const apiHintEl = maybeElement(header.querySelector("[data-api-hint]"), isHTMLElement);
-	if (apiInput) apiInput.value = getConfigurableBase();
-	updateHeader(store, statusEl, storageEl, apiHintEl);
+	const storageTextEl = requiredElement(header.querySelector("[data-storage-text]"), isHTMLElement, "storage text");
+	const storageBarEl = requiredElement(header.querySelector("[data-storage-bar]"), isHTMLElement, "storage bar");
+	const storageFillEl = requiredElement(header.querySelector("[data-storage-fill]"), isHTMLElement, "storage fill");
+	const apiUrlEl = requiredElement(header.querySelector("[data-api-url]"), isHTMLElement, "api url");
+	const apiErrEl = maybeElement(header.querySelector("[data-api-err]"), isHTMLElement);
+	updateHeader(store, statusEl, storageEl, apiUrlEl);
+	let apiEditing = false;
+	let apiErrTimer: ReturnType<typeof setTimeout> | null = null;
+	const hideApiError = (): void => {
+		if (apiErrTimer != null) {
+			clearTimeout(apiErrTimer);
+			apiErrTimer = null;
+		}
+		if (apiErrEl) {
+			apiErrEl.textContent = "";
+			apiErrEl.classList.remove("show");
+		}
+	};
+	const showApiError = (msg: string): void => {
+		if (!apiErrEl) return;
+		apiErrEl.textContent = msg;
+		apiErrEl.classList.add("show");
+		if (apiErrTimer != null) clearTimeout(apiErrTimer);
+		apiErrTimer = setTimeout(hideApiError, 4000);
+	};
+	const endApiEdit = (): void => {
+		apiEditing = false;
+		clear(apiUrlEl);
+		apiUrlEl.textContent = getConfigurableBase();
+		hideApiError();
+	};
+	const beginApiEdit = (): void => {
+		if (apiEditing) return;
+		apiEditing = true;
+		clear(apiUrlEl);
+		const input = document.createElement("input");
+		input.type = "url";
+		input.value = getConfigurableBase();
+		input.spellcheck = false;
+		input.autocomplete = "off";
+		input.className = "api-url-input";
+		input.setAttribute("aria-label", "API server URL");
+		apiUrlEl.appendChild(input);
+		input.focus();
+		input.select();
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") {
+				try {
+					store.setApiBase(input.value);
+					endApiEdit();
+				} catch (err) {
+					showApiError(err instanceof Error ? err.message : String(err));
+					input.focus();
+				}
+			} else if (e.key === "Escape") {
+				endApiEdit();
+			}
+		});
+		input.addEventListener("blur", () => {
+			if (apiEditing) endApiEdit();
+		});
+	};
+	apiUrlEl.addEventListener("click", beginApiEdit);
 
 	const app = h("div", { class: "app" }, [
 		header,
 		buildLayout(),
-		h("div", { id: "overlay-root" }),
 		h("div", { id: "lightbox-root" }),
+		h("div", { id: "storage-root" }),
 	]);
 	clear(root);
 	root.appendChild(app);
@@ -53,23 +194,28 @@ export function mount(store: Store, root: HTMLElement): void {
 	const queueRowsEl = requiredElement(layout.querySelector("#queueRows"), isHTMLElement, "queue rows");
 	const historyRowsEl = requiredElement(layout.querySelector("#historyRows"), isHTMLElement, "history rows");
 	const listEmptyEl = requiredElement(layout.querySelector("#listEmpty"), isHTMLElement, "list empty");
-	const overlayEl = requiredElement(app.querySelector("#overlay-root"), isHTMLElement, "overlay");
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
+	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
 
-	// Lightbox: click an input image anywhere in the list (or detail) to view it at its native size, shrunk to fit the viewport.
+	// Lightbox: click the media preview or an input thumbnail anywhere in the list to view it enlarged, shrunk to fit the viewport.
 	// Clicking the backdrop closes it.
-	let lightboxSrc: string | null = null;
+	let lightbox: { kind: "image" | "video"; src: string; filename: string } | null = null;
 	const renderLightbox = (): void => {
 		clear(lightboxEl);
-		if (!lightboxSrc) {
+		if (!lightbox) {
 			lightboxEl.style.display = "none";
 			return;
 		}
 		lightboxEl.style.display = "block";
 		lightboxEl.appendChild(
 			h("div", { class: "overlay lightbox-overlay" }, [
-				h("img", { class: "lightbox-media", src: lightboxSrc, alt: "Enlarged input image" }),
-				h("button", { class: "btn lightbox-close", "data-action": "close-lightbox" }, "Close"),
+				lightbox.kind === "video"
+					? h("video", { class: "lightbox-media", src: lightbox.src, controls: true, playsinline: true, autoplay: true })
+					: h("img", { class: "lightbox-media", src: lightbox.src, alt: "Enlarged media" }),
+				h("div", { class: "lightbox-bar" }, [
+					h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download"),
+					h("button", { class: "btn", "data-action": "close-lightbox" }, "Close"),
+				]),
 			]),
 		);
 	};
@@ -79,7 +225,7 @@ export function mount(store: Store, root: HTMLElement): void {
 		const inHistory = store.history.items().find((i) => i.id === id)?.files.find((f) => f.name === name);
 		return inHistory ? inHistory.dataUrl : null;
 	};
-	// Capture-phase guard: interacting with a row's prompt block or actions (e.g. expanding the collapsed <details>) must not bubble into the history-row click that opens the detail modal.
+	// Capture-phase guard: interacting with a row's prompt block or actions (e.g. expanding the collapsed <details>) must not bubble into the history-row click.
 	// Elements that carry their own [data-action] (thumbnails, download buttons) still bubble normally.
 	app.addEventListener(
 		"click",
@@ -87,7 +233,7 @@ export function mount(store: Store, root: HTMLElement): void {
 			const target = event.target;
 			if (!(target instanceof HTMLElement)) return;
 			// Only swallow clicks that are not themselves actionable controls (thumbnails / download buttons) living inside the block.
-			// The row itself carries data-action="select-history", so we must check for a *descendant* [data-action], not any ancestor.
+			// The row itself is no longer a click action, but we still only swallow clicks that are not actionable controls.
 			const block = target.closest(".prompt-block, .row-actions");
 			if (block && !target.closest(".prompt-block [data-action], .row-actions [data-action]")) {
 				event.stopPropagation();
@@ -99,24 +245,49 @@ export function mount(store: Store, root: HTMLElement): void {
 	app.addEventListener("click", (event) => {
 		const target = event.target;
 		if (!(target instanceof HTMLElement)) return;
-		// Clicking the overlay backdrop (outside the content) closes it.
+		if (target.classList.contains("storage-overlay")) {
+			storageModalOpen = false;
+			renderStorageModal();
+			return;
+		}
+		// Clicking the overlay backdrop closes the lightbox.
 		if (target.classList.contains("overlay")) {
-			if (target.classList.contains("lightbox-overlay")) lightboxSrc = null;
-			else store.selectHistory(null);
+			lightbox = null;
 			renderLightbox();
 			return;
 		}
 		const actionEl = maybeElement(target.closest("[data-action]"), isHTMLElement);
 		if (!actionEl) return;
 		const action = actionEl.getAttribute("data-action");
-		const id = actionEl.getAttribute("data-id") ?? "";
-		if (action === "view-image" && id) {
+		if (action === "view-image") {
 			event.stopPropagation();
-			lightboxSrc = lookupImage(id, actionEl.getAttribute("data-name") ?? "");
+			const name = actionEl.getAttribute("data-name") ?? "";
+			const src = lookupImage(actionEl.getAttribute("data-id") ?? "", name) ?? actionEl.getAttribute("src") ?? "";
+			if (src) lightbox = { kind: "image", src, filename: name || "image" };
 			renderLightbox();
+		} else if (action === "view-video") {
+			event.stopPropagation();
+			const id = actionEl.getAttribute("data-id") ?? "";
+			const src = actionEl.getAttribute("src") ?? "";
+			const isVideo = actionEl instanceof HTMLVideoElement;
+			const item = store.history.items().find((i) => i.id === id);
+			const filename = item ? mediaDownloadName(item) : `${id || "media"}.${isVideo ? "webm" : "webp"}`;
+			if (src) lightbox = { kind: isVideo ? "video" : "image", src, filename };
+			renderLightbox();
+		} else if (action === "download-lightbox") {
+			event.stopPropagation();
+			if (lightbox) downloadDataUrl(lightbox.src, lightbox.filename);
 		} else if (action === "close-lightbox") {
-			lightboxSrc = null;
+			lightbox = null;
 			renderLightbox();
+		} else if (action === "open-storage") {
+			event.stopPropagation();
+			storageModalOpen = true;
+			renderStorageModal();
+		} else if (action === "close-storage") {
+			event.stopPropagation();
+			storageModalOpen = false;
+			renderStorageModal();
 		}
 	});
 
@@ -150,19 +321,8 @@ export function mount(store: Store, root: HTMLElement): void {
 		updateListEmpty();
 	}
 
-	function renderOverlay(): void {
-		clear(overlayEl);
-		const item = store.history.items().find((i) => i.id === store.state.selectedId);
-		if (!item) {
-			overlayEl.style.display = "none";
-			return;
-		}
-		overlayEl.style.display = "block";
-		overlayEl.appendChild(buildDetail(item));
-	}
-
 	function render(): void {
-		updateHeader(store, statusEl, storageEl, apiHintEl);
+		updateHeader(store, statusEl, storageEl, apiUrlEl);
 		if (store.revs.form !== lastFormRev) {
 			lastFormRev = store.revs.form;
 			renderForm();
@@ -176,10 +336,7 @@ export function mount(store: Store, root: HTMLElement): void {
 			lastHistorySig = sig;
 			renderHistorySection();
 		}
-		if (store.state.selectedId !== lastSelectedId) {
-			lastSelectedId = store.state.selectedId;
-			renderOverlay();
-		}
+		renderStorageModal();
 	}
 
 	store.subscribe(render);
@@ -208,8 +365,12 @@ export function mount(store: Store, root: HTMLElement): void {
 
 	// Update live elapsed timers in place (does not rebuild video elements).
 	setInterval(() => updateElapsed(store), 1000);
+	// Refresh the quota meter on a throttled cadence (StorageManager estimates are best-effort).
+	refreshStorageMeter();
+	setInterval(() => void refreshStorageMeter(), 2000);
 
 	setupDelegated(store, app);
+	setupFavicon(store);
 
 	// Kick off right away in case a pump needs to resume.
 	// After a reload there is nothing to resume, but the call is cheap and safe.
@@ -221,42 +382,22 @@ function buildHeader(): HTMLElement {
 		h("div", { class: "brand" }, [h("h1", {}, "Video Studio")]),
 		h("div", { class: "topbar-right" }, [
 			h("span", { class: "status warn" }, "Connecting…"),
-			h("span", { class: "storage-note" }, ""),
-			h("details", { class: "api-settings" }, [
-				h("summary", { title: "Configure the API server" }, "API"),
-				h("div", { class: "api-settings-body" }, [
-					h("label", { class: "field" }, [
-						h("span", {}, "Server URL"),
-						h("input", {
-							type: "url",
-							id: "apiBase",
-							name: "apiBase",
-							"data-api-base": "",
-							placeholder: "http://localhost:1234",
-							spellcheck: "false",
-							"aria-label": "API server URL",
-						}),
-					]),
-					h("div", { class: "api-settings-actions" }, [
-						h("button", {
-							class: "btn small primary",
-							type: "button",
-							"data-action": "apply-api-base",
-						}, "Apply"),
-						h("button", {
-							class: "btn small",
-							type: "button",
-							"data-action": "reset-api-base",
-						}, "Reset"),
-					]),
-					h("p", { class: "api-settings-hint", "data-api-hint": "" }, ""),
+			h("div", { class: "api-inline" }, [
+				h("span", { class: "api-url", "data-api-url": "", title: "Click to edit the API server URL" }, ""),
+				h("span", { class: "api-err", "data-api-err": "" }, ""),
+			]),
+			h("div", { class: "storage-inline", "data-action": "open-storage", title: "Manage saved history and storage" }, [
+				h("span", { class: "storage-note" }, ""),
+				h("div", { class: "storage-meter", "data-storage-bar": "" }, [
+					h("div", { class: "storage-meter-fill", "data-storage-fill": "" }),
 				]),
+				h("span", { class: "storage-meta", "data-storage-text": "" }, ""),
 			]),
 		]),
 	]);
 }
 
-function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElement, apiHintEl: HTMLElement | null): void {
+function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElement, apiUrlEl: HTMLElement): void {
 	if (store.state.online) {
 		statusEl.textContent = "Online";
 		statusEl.className = "status ok";
@@ -268,7 +409,8 @@ function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElemen
 		statusEl.textContent = "Connecting…";
 		statusEl.className = "status warn";
 	}
-	if (apiHintEl) apiHintEl.textContent = `API: ${store.state.apiBase}`;
+	// Don't clobber an in-progress URL edit.
+	if (!apiUrlEl.querySelector("input")) apiUrlEl.textContent = getConfigurableBase();
 	if (store.history.isPersistent()) {
 		storageEl.textContent = "history saved";
 		storageEl.title = "History is saved in this browser.";
@@ -310,7 +452,7 @@ function buildForm(store: Store): HTMLElement {
 							h("span", { class: "key" }, "images"),
 							h("div", { class: "thumbs" },
 								f.analysis.files.map((file) =>
-									h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name }),
+									h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name }),
 								)),
 						])
 					  : null,
@@ -427,7 +569,7 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0): HTML
 	}
 
 	const body: Child[] = [
-		h("div", { class: "row-head" }, [chip, h("div", { class: "row-title" }, truncate(item.prompt, 90))]),
+		h("div", { class: "row-head" }, [chip, h("div", { class: "row-title" }, truncate(itemTitle(item), 90))]),
 		meta,
 		promptBlock,
 	];
@@ -443,22 +585,29 @@ function buildHistoryRows(store: Store): HTMLElement[] {
 
 function buildHistoryRow(item: HistoryItem): HTMLElement {
 	const src = mediaSrc(item);
-	const media = item.video.mime === "image/webp" ? h("img", { class: "row-media", src, alt: item.prompt, loading: "lazy" }) : h("video", { class: "row-media", src, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt });
+	const media = item.video.mime === "image/webp" ? h("img", { class: "row-media", src, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id }) : h("video", { class: "row-media", src, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
 
-	const meta = h("div", { class: "job-meta" }, [
-		h("span", {}, `${formatElapsed(item.elapsedMs)} · ${item.frameCount}f · ${item.width}×${item.height}`),
-	]);
-
-	return h("li", {
-		class: "job-row history",
-		"data-action": "select-history",
-		"data-id": item.id,
-		title: "Open details",
-	}, [
+	return h("li", { class: "job-row history" }, [
 		media,
 		h("div", { class: "row-body" }, [
-			h("div", { class: "row-title" }, truncate(item.prompt, 90)),
-			meta,
+			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),
+			h("div", { class: "job-meta" }, [
+				h("span", {}, `${formatElapsed(item.elapsedMs)} · ${item.frameCount}f · ${item.width}×${item.height}`),
+				h("div", { class: "row-actions" }, [
+					h("button", {
+						class: "btn small",
+						"data-action": "download-zip",
+						"data-id": item.id,
+						title: "Download source zip",
+					}, "Download zip"),
+					h("button", {
+						class: "btn small danger",
+						"data-action": "delete-history",
+						"data-id": item.id,
+						title: "Remove this item",
+					}, "Delete"),
+				]),
+			]),
 			h("details", { class: "prompt-block" }, [
 				h("summary", {}, "Prompt"),
 				h("p", {}, item.prompt),
@@ -478,80 +627,89 @@ function buildHistoryRow(item: HistoryItem): HTMLElement {
 					: null,
 			]),
 		]),
-		h("div", { class: "row-actions" }, [
-			h("button", {
-				class: "btn small",
-				"data-action": "download-video",
-				"data-id": item.id,
-				title: "Download video",
-			}, "Download"),
-		]),
-	]);
-}
-
-function buildDetail(item: HistoryItem): HTMLElement {
-	const src = mediaSrc(item);
-	const media = item.video.mime === "image/webp" ? h("img", { class: "detail-media", src, alt: item.prompt }) : h("video", { class: "detail-media", src, controls: true, playsinline: true });
-
-	const files = item.files.length
-		? h("div", { class: "detail-files" }, [
-			  h("h3", {}, "Input files"),
-			  h("div", { class: "thumbs" },
-				  item.files.map((f, i) =>
-					  h("figure", { class: "file-fig" }, [
-						  h("img", {
-							  class: "thumb",
-							  src: f.dataUrl,
-							  alt: f.name,
-							  "data-action": "view-image",
-							  "data-id": item.id,
-							  "data-name": f.name,
-						  }),
-						  h("figcaption", {}, f.name),
-						  h("button", {
-							  class: "btn small",
-							  "data-action": "download-file",
-							  "data-id": item.id,
-							  "data-file-index": String(i),
-						  }, "Save"),
-					  ]),
-				  )),
-		  ])
-		: null;
-
-	return h("div", { class: "overlay" }, [
-		h("div", { class: "modal" }, [
-			h("div", { class: "modal-head" }, [
-				h("h2", {}, "Generation details"),
-				h("button", { class: "btn", "data-action": "close-detail" }, "Close"),
-			]),
-			h("div", { class: "detail-meta" }, [
-				h("span", {}, `${formatElapsed(item.elapsedMs)} elapsed · ${item.frameCount} frames · ${item.width}×${item.height} @${item.fps}fps`),
-			]),
-			media,
-			h("div", { class: "detail-prompt" }, [
-				h("h3", {}, "Prompt"),
-				h("pre", {}, item.prompt),
-			]),
-			files,
-			h("div", { class: "detail-actions" }, [
-				h("button", {
-					class: "btn primary",
-					"data-action": "download-video",
-					"data-id": item.id,
-				}, "Download video"),
-				h("button", {
-					class: "btn secondary",
-					"data-action": "download-zip",
-					"data-id": item.id,
-				}, "Download source zip"),
-			]),
-		]),
 	]);
 }
 
 function mediaSrc(item: HistoryItem): string {
 	return `data:${item.video.mime};base64,${item.video.b64}`;
+}
+
+/** The uploaded zip's filename with its trailing .zip extension stripped, or "" when absent. */
+function zipStem(name: string | null): string {
+	return name?.replace(/\.zip$/i, "") ?? "";
+}
+
+/** Human-facing title for a row/item: the zip filename (minus extension), falling back to the prompt then the id. */
+function itemTitle(item: { prompt: string; id: string; zipName: string | null }): string {
+	return zipStem(item.zipName) || item.prompt || item.id;
+}
+
+/** Derive a download filename for a history item's media preview from its zip name (or prompt) and output format. */
+function mediaDownloadName(item: HistoryItem): string {
+	const stem = zipStem(item.zipName) || sanitizeBasename(item.prompt) || item.id;
+	return `${stem}.${item.video.format}`;
+}
+
+const PIE_COLORS = ["#5b8cff", "#e6b45c", "#4cc38a", "#e0605f", "#c678dd", "#7aa3b0"];
+
+function historyItemBytes(item: HistoryItem): number {
+	const video = item.video.b64.length;
+	const files = item.files.reduce((n, f) => n + f.dataUrl.length, 0);
+	return Math.round(((video + files) * 3) / 4);
+}
+
+function drawStoragePie(canvas: HTMLCanvasElement, slices: { value: number; color: string }[], usage: number, quota: number): void {
+	const size = 220;
+	canvas.width = size;
+	canvas.height = size;
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return;
+	const cx = size / 2;
+	const cy = size / 2;
+	const r = 88;
+	const total = quota > 0 ? quota : usage > 0 ? usage : 1;
+	const used = usage > 0 ? usage : 0;
+	const itemTotal = slices.reduce((n, s) => n + s.value, 0);
+	let start = -Math.PI / 2;
+	if (itemTotal > 0 && used > 0) {
+		for (const s of slices) {
+			const angle = ((used * (s.value / itemTotal)) / total) * Math.PI * 2;
+			ctx.beginPath();
+			ctx.moveTo(cx, cy);
+			ctx.arc(cx, cy, r, start, start + angle);
+			ctx.closePath();
+			ctx.fillStyle = s.color;
+			ctx.fill();
+			start += angle;
+		}
+	}
+	const otherVal = itemTotal === 0 ? used : used - itemTotal;
+	if (otherVal > 0) {
+		const angle = (otherVal / total) * Math.PI * 2;
+		if (angle > 0) {
+			ctx.beginPath();
+			ctx.moveTo(cx, cy);
+			ctx.arc(cx, cy, r, start, start + angle);
+			ctx.closePath();
+			ctx.fillStyle = "#333a47";
+			ctx.fill();
+			start += angle;
+		}
+	}
+	if (total > used) {
+		const angle = ((total - used) / total) * Math.PI * 2;
+		ctx.beginPath();
+		ctx.moveTo(cx, cy);
+		ctx.arc(cx, cy, r, start, start + angle);
+		ctx.closePath();
+		ctx.fillStyle = "#222832";
+		ctx.fill();
+	}
+	ctx.fillStyle = "#e6e9ee";
+	ctx.font = "bold 18px system-ui, sans-serif";
+	ctx.textAlign = "center";
+	ctx.textBaseline = "middle";
+	ctx.fillText(formatBytes(usage), cx, cy);
 }
 
 async function handleZipFile(store: Store, file: File): Promise<void> {
@@ -592,48 +750,25 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 			case "move-down":
 				moveQueueItem(store, id, action === "move-up" ? -1 : 1);
 				break;
-			case "select-history":
-				store.selectHistory(id);
+			case "delete-history":
+				store.removeHistory(id);
 				break;
-			case "close-detail":
-				store.selectHistory(null);
-				break;
-			case "apply-api-base": {
-				const input = maybeElement(root.querySelector("#apiBase"), isInputElement);
+			case "delete-oldest": {
+				const input = maybeElement(root.querySelector("[data-delete-oldest-count]"), isInputElement);
 				if (!input) break;
-				const hint = maybeElement(root.querySelector("[data-api-hint]"), isHTMLElement);
-				try {
-					const normalized = store.setApiBase(input.value);
-					input.value = normalized;
-					if (hint) {
-						hint.textContent = "";
-						hint.classList.remove("error");
-					}
-				} catch (err) {
-					if (hint) {
-						hint.textContent = err instanceof Error ? err.message : String(err);
-						hint.classList.add("error");
-					}
+				const n = Number(input.value);
+				if (!Number.isFinite(n) || n < 1) break;
+				store.removeOldestHistory(Math.floor(n));
+				break;
+			}
+			case "clear-history":
+				if (window.confirm("Clear all saved history? This cannot be undone.")) {
+					store.clearHistory();
 				}
-				break;
-			}
-			case "reset-api-base": {
-				const input = maybeElement(root.querySelector("#apiBase"), isInputElement);
-				store.resetApiBase();
-				if (input) input.value = store.state.defaultApiBase;
-				break;
-			}
-			case "download-video":
-				void downloadVideo(store, id);
 				break;
 			case "download-zip":
 				void downloadSourceZip(store, id);
 				break;
-			case "download-file": {
-				const fileIndex = Number(target.getAttribute("data-file-index") ?? "");
-				void downloadFile(store, id, Number.isFinite(fileIndex) ? fileIndex : -1);
-				break;
-			}
 			default:
 				break;
 		}
@@ -721,6 +856,7 @@ function addToQueue(store: Store): void {
 		id: uid("q_"),
 		status: "queued",
 		prompt: analysis.prompt,
+		zipName: f.zipName,
 		mode: analysis.mode,
 		files: analysis.files,
 		width,
@@ -792,7 +928,7 @@ async function downloadSourceZip(store: Store, id: string): Promise<void> {
 	const url = URL.createObjectURL(blob);
 	const a = document.createElement("a");
 	a.href = url;
-	a.download = `${id}.zip`;
+	a.download = item.zipName ?? `${id}.zip`;
 	document.body.appendChild(a);
 	a.click();
 	a.remove();

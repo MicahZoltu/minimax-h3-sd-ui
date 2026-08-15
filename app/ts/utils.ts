@@ -51,3 +51,13 @@ export function bytesToBlob(bytes: Uint8Array, type: string): Blob {
 export function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** Safely derive a filesystem-friendly basename (no path separators or illegal chars, trimmed, length-capped). */
+export function sanitizeBasename(value: string): string {
+	const cleaned = value
+		.replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/^\.+|\.+$/g, "");
+	return cleaned.length > 0 ? cleaned.slice(0, 60) : "";
+}

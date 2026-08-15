@@ -44,3 +44,12 @@ export function downloadFile(store: Store, id: string, index: number): void {
 	const blob = bytesToBlob(dataUrlToBytes(file.dataUrl), "application/octet-stream");
 	triggerDownload(blob, file.name);
 }
+
+/** Download a raw data URL (e.g. media) under a chosen filename. */
+export function downloadDataUrl(dataUrl: string, filename: string): void {
+	const comma = dataUrl.indexOf(",");
+	const header = comma > 0 ? dataUrl.slice(0, comma) : "";
+	const mime = header.startsWith("data:") ? (header.slice(5).split(";")[0] ?? "application/octet-stream") : "application/octet-stream";
+	const blob = bytesToBlob(dataUrlToBytes(dataUrl), mime);
+	triggerDownload(blob, filename);
+}

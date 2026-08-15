@@ -28,6 +28,8 @@ export interface QueueItem {
 	id: string;
 	status: QueueStatus;
 	prompt: string;
+	/** Original uploaded .zip filename, so a source-zip download can restore it. */
+	zipName: string | null;
 	mode: ZipMode;
 	files: ZipFile[];
 	width: number;
@@ -68,6 +70,8 @@ export interface HistoryItem {
 	startedAt: number;
 	completedAt: number;
 	video: VideoData;
+	/** Original uploaded .zip filename, so a source-zip download can restore it. */
+	zipName: string | null;
 	/** Whether this item is persisted to localStorage. */
 	persisted: boolean;
 }

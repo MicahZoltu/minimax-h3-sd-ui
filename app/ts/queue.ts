@@ -25,6 +25,24 @@ export function hasActiveJob(store: Store): boolean {
 	return store.state.queue.some((i) => i.status === "submitting" || i.status === "generating");
 }
 
+/**
+ * Re-attach to server jobs that were in flight when the page was reloaded.
+ * The queue (including each item's `serverId`) is persisted, so an item that was `generating` can resume simply by polling its server job again.
+ * An item stuck at `submitting` without a `serverId` cannot be traced to a server job, so it degrades to a failed note per the product requirement.
+ * This runs synchronously before the pump starts, so a resumed job still occupies the single active slot and keeps the pump from double-submitting.
+ */
+export function resumeActiveJobs(store: Store): void {
+	for (const item of [...store.state.queue]) {
+		if (item.status !== "submitting" && item.status !== "generating") continue;
+		if (item.serverId) {
+			// Continue the queue once the resumed job reaches a terminal state.
+			void pollUntilTerminal(store, item.id, item.serverId, "generation lost due to page refresh").then(() => void pump(store));
+		} else {
+			store.patchQueueItem(item.id, { status: "failed", error: "generation lost due to page refresh" });
+		}
+	}
+}
+
 function nextPending(store: Store): QueueItem | undefined {
 	return store.state.queue.find((i) => i.status === "queued");
 }
@@ -77,7 +95,7 @@ async function submitWithRetry(body: unknown): Promise<Job> {
 
 const MAX_CONSECUTIVE_POLL_ERRORS = 120;
 
-async function pollUntilTerminal(store: Store, itemId: string, serverId: string): Promise<void> {
+async function pollUntilTerminal(store: Store, itemId: string, serverId: string, lostJobMessage = "The server lost track of this job."): Promise<void> {
 	let consecutiveErrors = 0;
 	while (true) {
 		await sleep(POLL_MS);
@@ -90,7 +108,7 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string)
 			consecutiveErrors = 0;
 		} catch (err) {
 			if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
-				store.patchQueueItem(itemId, { status: "failed", error: "The server lost track of this job." });
+				store.patchQueueItem(itemId, { status: "failed", error: lostJobMessage });
 				return;
 			}
 			// Transient network/server issue: the job may still be running, so keep polling, but bound how long we wait before giving up.
@@ -142,6 +160,7 @@ function handleCompleted(store: Store, itemId: string, job: Job): void {
 		id: uid("h_"),
 		createdAt: Date.now(),
 		prompt: item.prompt,
+		zipName: item.zipName,
 		mode: item.mode,
 		files: item.files,
 		width: item.width,

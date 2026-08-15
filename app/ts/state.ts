@@ -5,7 +5,8 @@
 import { getCapabilities, type Capabilities } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
 import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
-import { createHistoryStore, detectSyncStorage } from "./history.js";
+import { createHistoryStore, createQueuePersistence, detectSyncStorage } from "./history.js";
+import { createIdbHistory } from "./idb.js";
 import { GENERATION_PRESET } from "./request.js";
 
 // Keys of QueueItem, used to apply partial patches without untyped casts.
@@ -54,7 +55,6 @@ export interface AppState {
 	defaultApiBase: string;
 	queue: QueueItem[];
 	form: NewJobForm;
-	selectedId: string | null;
 }
 
 export interface Revisions {
@@ -77,7 +77,8 @@ export interface Store {
 	moveQueue(from: number, to: number): void;
 	addHistory(item: HistoryItem): void;
 	removeHistory(id: string): void;
-	selectHistory(id: string | null): void;
+	removeOldestHistory(count: number): void;
+	clearHistory(): void;
 	setForm(patch: Partial<NewJobForm>): void;
 	/**
 	 * Set a new API base; throws on invalid input.
@@ -112,9 +113,11 @@ export function createStore(): Store {
 			error: null,
 			parsing: false,
 		},
-		selectedId: null,
 	};
-	const history = createHistoryStore(detectSyncStorage());
+	const storage = detectSyncStorage();
+	const history = createHistoryStore(createIdbHistory());
+	const queuePersistence = createQueuePersistence(storage);
+	state.queue = queuePersistence.load();
 
 	// Revision counters: the UI re-renders a region only when its counter changes, which keeps background polling from rebuilding the form and stealing focus while the user is typing.
 	const revs: Revisions = { form: 0, queue: 0 };
@@ -153,7 +156,8 @@ export function createStore(): Store {
 		}
 	};
 
-	return {
+	// History is hydrated asynchronously from the backend; emit once it lands so the UI renders persisted items.
+	const store: Store = {
 		state,
 		revs,
 		history,
@@ -171,6 +175,7 @@ export function createStore(): Store {
 			state.queue.unshift(item);
 			revs.queue += 1;
 			emit();
+			queuePersistence.save(state.queue);
 		},
 		patchQueueItem: (id, patch) => {
 			const item = state.queue.find((i) => i.id === id);
@@ -187,6 +192,7 @@ export function createStore(): Store {
 				Object.assign(item, patch);
 				revs.queue += 1;
 				emit();
+				queuePersistence.save(state.queue);
 			}
 		},
 		removeQueue: (id) => {
@@ -195,6 +201,7 @@ export function createStore(): Store {
 			state.queue.splice(idx, 1);
 			revs.queue += 1;
 			emit();
+			queuePersistence.save(state.queue);
 		},
 		moveQueue: (from, to) => {
 			const q = state.queue;
@@ -203,6 +210,7 @@ export function createStore(): Store {
 			if (item === undefined) return;
 			q.splice(to, 0, item);
 			revs.queue += 1;
+			queuePersistence.save(state.queue);
 			emit();
 		},
 		addHistory: (item) => {
@@ -211,11 +219,14 @@ export function createStore(): Store {
 		},
 		removeHistory: (id) => {
 			history.remove(id);
-			if (state.selectedId === id) state.selectedId = null;
 			emit();
 		},
-		selectHistory: (id) => {
-			state.selectedId = id;
+		removeOldestHistory: (count) => {
+			history.removeOldest(count);
+			emit();
+		},
+		clearHistory: () => {
+			history.clear();
 			emit();
 		},
 		setApiBase: (value) => {
@@ -233,4 +244,7 @@ export function createStore(): Store {
 		},
 		fetchCapabilities,
 	};
+
+	void history.load().then(() => emit());
+	return store;
 }

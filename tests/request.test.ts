@@ -8,6 +8,7 @@ function baseItem(partial: Partial<QueueItem> = {}): QueueItem {
 		id: "q_1",
 		status: "queued",
 		prompt: "a dog",
+		zipName: null,
 		mode: "prompt",
 		files: [],
 		width: 640,
