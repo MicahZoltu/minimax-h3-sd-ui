@@ -52,7 +52,7 @@ export function paintFavicon(view: FaviconView): void {
 	if (!ctx) return;
 	// A single max-size digit is the whole icon: its value is the in-flight count, its color is the unreviewed state.
 	const label = view.active > 9 ? "9+" : String(view.active);
-	ctx.fillStyle = view.unreviewed ? "#5b8cff" : "#9aa3b0";
+	ctx.fillStyle = view.unreviewed ? "#4cc38a" : "#5b8cff";
 	ctx.textAlign = "center";
 	ctx.textBaseline = "middle";
 	ctx.font = `bold ${label.length > 1 ? 40 : 58}px system-ui, sans-serif`;
