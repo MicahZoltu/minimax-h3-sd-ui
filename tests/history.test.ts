@@ -36,7 +36,8 @@ function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 		elapsedMs: 1000,
 		startedAt: Date.now() - 1000,
 		completedAt: Date.now(),
-		video: { b64: "AAAA", mime: "video/webm", format: "webm" },
+		thumbnail: "",
+		video: { mime: "video/webm", format: "webm", byteSize: 3 },
 		persisted: false,
 		...overrides,
 	};
@@ -72,7 +73,7 @@ function memoryBackend(): HistoryBackend & { data(): HistoryItem[] } {
 		async loadAll() {
 			return data.map((i) => ({ ...i, persisted: true }));
 		},
-		async save(item) {
+		async save(item, _videoBlob) {
 			data.push(item);
 		},
 		async remove(id) {
@@ -81,6 +82,9 @@ function memoryBackend(): HistoryBackend & { data(): HistoryItem[] } {
 		},
 		async clear() {
 			data.length = 0;
+		},
+		async loadVideoBlob(_id) {
+			return null;
 		},
 		data: () => data,
 	};
@@ -101,9 +105,12 @@ function validatingBackend(): HistoryBackend & { setData(entries: unknown[]): vo
 			}
 			return out;
 		},
-		async save() {},
+		async save(_item, _videoBlob) {},
 		async remove() {},
 		async clear() {},
+		async loadVideoBlob(_id) {
+			return null;
+		},
 		setData(entries: unknown[]) {
 			data = entries;
 		},
@@ -168,8 +175,8 @@ describe("createHistoryStore", () => {
 	it("keeps items purely in memory when no backend is available", () => {
 		const store = createHistoryStore(null);
 		expect(store.isPersistent()).toBe(false);
-		store.add(makeItem());
-		store.add(makeItem());
+		store.add(makeItem(), new Blob([]));
+		store.add(makeItem(), new Blob([]));
 		expect(store.items().length).toBe(2);
 		expect(store.items().every((i) => i.persisted === false)).toBe(true);
 	});
@@ -178,7 +185,7 @@ describe("createHistoryStore", () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const item = makeItem();
-		store.add(item);
+		store.add(item, new Blob([]));
 		expect(item.persisted).toBe(false);
 		await flush();
 		expect(item.persisted).toBe(true);
@@ -189,7 +196,7 @@ describe("createHistoryStore", () => {
 		const backend = memoryBackend();
 		const first = createHistoryStore(backend);
 		const item = makeItem();
-		first.add(item);
+		first.add(item, new Blob([]));
 		await flush();
 
 		const second = createHistoryStore(backend);
@@ -205,8 +212,8 @@ describe("createHistoryStore", () => {
 		const store = createHistoryStore(backend);
 		const a = makeItem();
 		const b = makeItem();
-		store.add(a);
-		store.add(b);
+		store.add(a, new Blob([]));
+		store.add(b, new Blob([]));
 		await flush();
 
 		store.remove(a.id);
@@ -222,7 +229,7 @@ describe("createHistoryStore", () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const items = [makeItem({ createdAt: 1 }), makeItem({ createdAt: 2 }), makeItem({ createdAt: 3 }), makeItem({ createdAt: 4 })];
-		for (const i of items) store.add(i);
+		for (const i of items) store.add(i, new Blob([]));
 		await flush();
 
 		store.removeOldest(2);
@@ -234,7 +241,7 @@ describe("createHistoryStore", () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const a = makeItem({ createdAt: 1 });
-		store.add(a);
+		store.add(a, new Blob([]));
 		await flush();
 		store.removeOldest(0);
 		store.removeOldest(-3);
@@ -244,8 +251,8 @@ describe("createHistoryStore", () => {
 	it("clear removes every item from memory and the backend", async () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
-		store.add(makeItem({ createdAt: 1 }));
-		store.add(makeItem({ createdAt: 2 }));
+		store.add(makeItem({ createdAt: 1 }), new Blob([]));
+		store.add(makeItem({ createdAt: 2 }), new Blob([]));
 		await flush();
 
 		store.clear();
@@ -270,7 +277,20 @@ describe("createHistoryStore", () => {
 
 	it("bounds in-memory growth to MAX_IN_MEMORY", () => {
 		const store = createHistoryStore(null);
-		for (let i = 0; i < 105; i++) store.add(makeItem({ createdAt: i }));
+		for (let i = 0; i < 105; i++) store.add(makeItem({ createdAt: i }), new Blob([]));
 		expect(store.items().length).toBe(100);
+	});
+
+	it("evicting over the in-memory cap never deletes from the backend archive", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		for (let i = 0; i < 110; i++) store.add(makeItem({ createdAt: i }), new Blob([]));
+		await flush();
+		expect(store.items().length).toBe(100);
+		expect(backend.data().length).toBe(110);
+
+		const reloaded = createHistoryStore(backend);
+		await reloaded.load();
+		expect(reloaded.items().length).toBe(110);
 	});
 });

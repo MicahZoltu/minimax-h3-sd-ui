@@ -22,7 +22,7 @@ export interface SyncStorage {
 
 const QUEUE_KEY = "sdcpp.video.queue";
 // Soft cap on in-memory items (each holds a full video) so an extended session cannot grow memory without bound.
-// Persisted items are dropped first.
+// Eviction drops items from the resident list only; the persisted archive is never pruned by this cap.
 const MAX_IN_MEMORY = 100;
 
 const QUEUE_STATUSES: QueueStatus[] = ["queued", "submitting", "generating", "completed", "failed", "cancelled"];
@@ -48,12 +48,12 @@ function isQueueItem(value: unknown): value is QueueItem {
 
 export function isHistoryItem(value: unknown): value is HistoryItem {
 	if (typeof value !== "object" || value === null) return false;
-	if (!("id" in value) || !("createdAt" in value) || !("video" in value)) return false;
-	if (typeof value.id !== "string" || typeof value.createdAt !== "number") return false;
+	if (!("id" in value) || !("createdAt" in value) || !("thumbnail" in value) || !("video" in value)) return false;
+	if (typeof value.id !== "string" || typeof value.createdAt !== "number" || typeof value.thumbnail !== "string") return false;
 	const video = value.video;
 	if (typeof video !== "object" || video === null) return false;
-	if (!("b64" in video) || !("mime" in video) || !("format" in video)) return false;
-	return typeof video.b64 === "string" && typeof video.mime === "string" && typeof video.format === "string" && ("zipName" in value) && (value.zipName === null || typeof value.zipName === "string");
+	if (!("mime" in video) || !("format" in video) || !("byteSize" in video)) return false;
+	return typeof video.mime === "string" && typeof video.format === "string" && typeof video.byteSize === "number" && ("zipName" in value) && (value.zipName === null || typeof value.zipName === "string");
 }
 
 export interface HistoryBackend {
@@ -61,18 +61,20 @@ export interface HistoryBackend {
 	isPersistent(): boolean;
 	/** Return every persisted item, or an empty array on any failure. */
 	loadAll(): Promise<HistoryItem[]>;
-	save(item: HistoryItem): Promise<void>;
+	save(item: HistoryItem, videoBlob: Blob): Promise<void>;
 	remove(id: string): Promise<void>;
 	clear(): Promise<void>;
+	loadVideoBlob(id: string): Promise<Blob | null>;
 }
 
 export interface HistoryStore {
 	items(): HistoryItem[];
-	add(item: HistoryItem): void;
+	add(item: HistoryItem, videoBlob: Blob): void;
 	remove(id: string): void;
 	removeOldest(count: number): void;
 	clear(): void;
 	isPersistent(): boolean;
+	loadVideoBlob(id: string): Promise<Blob | null>;
 	/** Hydrate persisted history into memory; resolves when items() reflects the backend. */
 	load(): Promise<void>;
 }
@@ -81,10 +83,10 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 	const items: HistoryItem[] = [];
 	let loadPromise: Promise<void> | null = null;
 
-	async function persistItem(item: HistoryItem): Promise<void> {
+	async function persistItem(item: HistoryItem, videoBlob: Blob): Promise<void> {
 		if (!backend) return;
 		try {
-			await backend.save(item);
+			await backend.save(item, videoBlob);
 			item.persisted = true;
 		} catch {
 			// Best-effort: a failed write leaves the item session-only rather than missing from the running list.
@@ -92,18 +94,12 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		}
 	}
 
-	// Bound in-memory growth; drop the oldest items over the cap (and from the backend, keeping both views consistent).
+	// Bound in-memory growth only; drop the oldest items from the resident list so an extended session cannot grow memory without bound.
+	// Eviction never touches the backend: the persisted archive stays intact so a refresh (via load()) restores everything.
 	function trimMemory(): void {
 		const excess = items.length - MAX_IN_MEMORY;
 		if (excess <= 0) return;
-		const removed = items.splice(0, excess);
-		for (const it of removed) {
-			if (it.persisted && backend) {
-				backend.remove(it.id).catch(() => {
-					// ignore
-				});
-			}
-		}
+		items.splice(0, excess);
 	}
 
 	return {
@@ -128,11 +124,15 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 			}
 			return loadPromise;
 		},
-		add(item: HistoryItem): void {
+		add(item: HistoryItem, videoBlob: Blob): void {
 			items.push(item);
 			item.persisted = false;
-			void persistItem(item);
+			void persistItem(item, videoBlob);
 			trimMemory();
+		},
+		loadVideoBlob(id: string): Promise<Blob | null> {
+			if (!backend) return Promise.resolve(null);
+			return backend.loadVideoBlob(id);
 		},
 		remove(id: string): void {
 			const idx = items.findIndex((i) => i.id === id);

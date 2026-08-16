@@ -43,10 +43,11 @@ export interface QueueItem {
 }
 
 export interface VideoData {
-	/** Raw base64 media payload from the server. */
-	b64: string;
+	/** MIME type of the binary video payload, e.g. "video/webm". */
 	mime: string;
 	format: string;
+	/** Approximate byte size of the stored binary video payload. */
+	byteSize: number;
 }
 
 export interface HistoryItem {
@@ -54,6 +55,8 @@ export interface HistoryItem {
 	/** Epoch ms when the item was created (client clock). */
 	createdAt: number;
 	prompt: string;
+	/** Original uploaded .zip filename, so a source-zip download can restore it. */
+	zipName: string | null;
 	mode: ZipMode;
 	files: ZipFile[];
 	/** Final width used for generation (request value). */
@@ -69,9 +72,9 @@ export interface HistoryItem {
 	/** Epoch ms from the server. */
 	startedAt: number;
 	completedAt: number;
+	/** Small single-frame preview image (data URL). */
+	thumbnail: string;
 	video: VideoData;
-	/** Original uploaded .zip filename, so a source-zip download can restore it. */
-	zipName: string | null;
 	/** Whether this item is persisted to localStorage. */
 	persisted: boolean;
 }

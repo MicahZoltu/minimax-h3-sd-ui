@@ -9,7 +9,7 @@ import type { Job } from "./api.js";
 import { buildVidGenRequest, mimeForFormat, GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
 import type { HistoryItem, QueueItem } from "./types.js";
-import { sleep, uid } from "./utils.js";
+import { base64ToBytes, bytesToBlob, sleep, uid } from "./utils.js";
 
 export const POLL_MS = 1500;
 const SUBMIT_RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -130,7 +130,7 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 		}
 
 		if (job.status === "completed") {
-			handleCompleted(store, itemId, job);
+			void handleCompleted(store, itemId, job);
 			return;
 		}
 		if (job.status === "failed") {
@@ -145,7 +145,7 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 	}
 }
 
-function handleCompleted(store: Store, itemId: string, job: Job): void {
+async function handleCompleted(store: Store, itemId: string, job: Job): Promise<void> {
 	const item = store.state.queue.find((i) => i.id === itemId);
 	const result = job.result;
 	const b64 = result?.b64_json || (result?.images && result.images[0]?.b64_json);
@@ -155,6 +155,15 @@ function handleCompleted(store: Store, itemId: string, job: Job): void {
 	}
 
 	const format = safeFormat(result.output_format);
+	const mime = mimeForFormat(format);
+	const videoBlob = bytesToBlob(base64ToBytes(b64), mime);
+	let thumbnail = "";
+	try {
+		thumbnail = await captureVideoThumbnail(b64, mime, format);
+	} catch {
+		// Thumbnail decode is best-effort; a missing preview must not fail the generation.
+		thumbnail = "";
+	}
 	const frameCount = result.frame_count !== undefined && Number.isFinite(result.frame_count) ? result.frame_count : item.jobFrames;
 	const fps = result.fps !== undefined && Number.isFinite(result.fps) ? result.fps : GENERATION_PRESET.fps;
 	const startedSec = job.started ?? job.completed ?? 0;
@@ -175,12 +184,52 @@ function handleCompleted(store: Store, itemId: string, job: Job): void {
 		elapsedMs,
 		startedAt: startedSec * 1000,
 		completedAt: completedSec * 1000,
-		video: { b64, mime: mimeForFormat(format), format },
+		thumbnail,
+		video: { mime, format, byteSize: videoBlob.size },
 		persisted: false,
 	};
 
-	store.addHistory(historyItem);
+	store.addHistory(historyItem, videoBlob);
 	store.removeQueue(itemId);
+	void store.setResident(historyItem.id);
+}
+
+async function captureVideoThumbnail(b64: string, mime: string, _format: string): Promise<string> {
+	// For image outputs (webp), the "video" is already a still; reuse it directly.
+	if (mime.startsWith("image/")) {
+		return `data:${mime};base64,${b64}`;
+	}
+	const blob = bytesToBlob(base64ToBytes(b64), mime);
+	const url = URL.createObjectURL(blob);
+	try {
+		const video = document.createElement("video");
+		video.src = url;
+		video.muted = true;
+		video.playsInline = true;
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("thumbnail timeout")), 10000);
+			video.addEventListener("loadeddata", () => { clearTimeout(timer); resolve(); }, { once: true });
+			video.addEventListener("error", () => { clearTimeout(timer); reject(new Error("thumbnail decode error")); }, { once: true });
+		});
+		if (video.videoWidth === 0 || video.videoHeight === 0) throw new Error("thumbnail has no dimensions");
+		video.currentTime = 0;
+		await new Promise<void>((resolve) => {
+			if (video.readyState >= 2 || video.currentTime !== 0) { resolve(); return; }
+			video.addEventListener("seeked", () => resolve(), { once: true });
+		});
+		const scale = Math.min(1, 320 / video.videoWidth);
+		const w = Math.max(1, Math.round(video.videoWidth * scale));
+		const h = Math.max(1, Math.round(video.videoHeight * scale));
+		const canvas = document.createElement("canvas");
+		canvas.width = w;
+		canvas.height = h;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) throw new Error("thumbnail canvas unavailable");
+		ctx.drawImage(video, 0, 0, w, h);
+		return canvas.toDataURL("image/jpeg", 0.7);
+	} finally {
+		URL.revokeObjectURL(url);
+	}
 }
 
 function safeFormat(outputFormat: unknown): string {

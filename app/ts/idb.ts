@@ -9,8 +9,9 @@ import { isHistoryItem, type HistoryBackend } from "./history.js";
 import type { HistoryItem } from "./types.js";
 
 const DB_NAME = "sdcpp.video";
-const DB_VERSION = 1;
-const STORE = "history";
+const DB_VERSION = 2;
+const HISTORY_STORE = "history";
+const MEDIA_STORE = "media";
 
 function database(): Promise<IDBDatabase | null> {
 	if (typeof globalThis.indexedDB === "undefined") return Promise.resolve(null);
@@ -18,8 +19,12 @@ function database(): Promise<IDBDatabase | null> {
 	return new Promise((resolve) => {
 		request.onupgradeneeded = () => {
 			const db = request.result;
-			if (!db.objectStoreNames.contains(STORE)) {
-				db.createObjectStore(STORE, { keyPath: "id" });
+			if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+				db.createObjectStore(HISTORY_STORE, { keyPath: "id" });
+			}
+			if (!db.objectStoreNames.contains(MEDIA_STORE)) {
+				// No keyPath: media values are raw binary Blobs, keyed explicitly via put(blob, id).
+				db.createObjectStore(MEDIA_STORE);
 			}
 		};
 		request.onsuccess = () => resolve(request.result);
@@ -35,13 +40,13 @@ function onRequest(request: IDBRequest): Promise<unknown> {
 	});
 }
 
-function runWrite(run: (store: IDBObjectStore) => void): Promise<void> {
+function runWrite(run: (history: IDBObjectStore, media: IDBObjectStore) => void): Promise<void> {
 	return database().then((db) => {
 		if (!db) return Promise.resolve();
 		return new Promise<void>((resolve) => {
 			try {
-				const tx = db.transaction(STORE, "readwrite");
-				run(tx.objectStore(STORE));
+				const tx = db.transaction([HISTORY_STORE, MEDIA_STORE], "readwrite");
+				run(tx.objectStore(HISTORY_STORE), tx.objectStore(MEDIA_STORE));
 				tx.oncomplete = () => resolve();
 				tx.onerror = () => resolve();
 				tx.onabort = () => resolve();
@@ -58,8 +63,8 @@ export function createIdbHistory(): HistoryBackend {
 		async loadAll(): Promise<HistoryItem[]> {
 			const db = await database();
 			if (!db) return [];
-			const tx = db.transaction(STORE, "readonly");
-			const raw: unknown = await onRequest(tx.objectStore(STORE).getAll());
+			const tx = db.transaction(HISTORY_STORE, "readonly");
+			const raw: unknown = await onRequest(tx.objectStore(HISTORY_STORE).getAll());
 			if (!Array.isArray(raw)) return [];
 			const out: HistoryItem[] = [];
 			for (const entry of raw) {
@@ -70,14 +75,31 @@ export function createIdbHistory(): HistoryBackend {
 			}
 			return out;
 		},
-		async save(item: HistoryItem): Promise<void> {
-			await runWrite((store) => void store.put(item));
+		async save(item: HistoryItem, videoBlob: Blob): Promise<void> {
+			await runWrite((history, media) => {
+				void history.put(item);
+				void media.put(videoBlob, item.id);
+			});
 		},
 		async remove(id: string): Promise<void> {
-			await runWrite((store) => void store.delete(id));
+			await runWrite((history, media) => {
+				void history.delete(id);
+				void media.delete(id);
+			});
 		},
 		async clear(): Promise<void> {
-			await runWrite((store) => void store.clear());
+			await runWrite((history, media) => {
+				void history.clear();
+				void media.clear();
+			});
+		},
+		async loadVideoBlob(id: string): Promise<Blob | null> {
+			const db = await database();
+			if (!db) return null;
+			const tx = db.transaction(MEDIA_STORE, "readonly");
+			const raw: unknown = await onRequest(tx.objectStore(MEDIA_STORE).get(id));
+			if (raw instanceof Blob) return raw;
+			return null;
 		},
 	};
 }

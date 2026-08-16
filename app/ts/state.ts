@@ -75,10 +75,14 @@ export interface Store {
 	patchQueueItem(id: string, patch: Partial<QueueItem>): void;
 	removeQueue(id: string): void;
 	moveQueue(from: number, to: number): void;
-	addHistory(item: HistoryItem): void;
+	addHistory(item: HistoryItem, videoBlob: Blob): void;
 	removeHistory(id: string): void;
 	removeOldestHistory(count: number): void;
 	clearHistory(): void;
+	setResident(id: string): Promise<void>;
+	residentId(): string | null;
+	residentUrl(): string | null;
+	residentBlob(): Blob | null;
 	setForm(patch: Partial<NewJobForm>): void;
 	/**
 	 * Set a new API base; throws on invalid input.
@@ -118,6 +122,7 @@ export function createStore(): Store {
 	const history = createHistoryStore(createIdbHistory());
 	const queuePersistence = createQueuePersistence(storage);
 	state.queue = queuePersistence.load();
+	let resident: { id: string; blob: Blob; url: string } | null = null;
 
 	// Revision counters: the UI re-renders a region only when its counter changes, which keeps background polling from rebuilding the form and stealing focus while the user is typing.
 	const revs: Revisions = { form: 0, queue: 0 };
@@ -133,6 +138,12 @@ export function createStore(): Store {
 	};
 
 	const findIndex = (id: string) => state.queue.findIndex((i) => i.id === id);
+
+	const clearResident = (): void => {
+		if (!resident) return;
+		URL.revokeObjectURL(resident.url);
+		resident = null;
+	};
 
 	const fetchCapabilities = async (): Promise<void> => {
 		try {
@@ -213,22 +224,38 @@ export function createStore(): Store {
 			queuePersistence.save(state.queue);
 			emit();
 		},
-		addHistory: (item) => {
-			history.add(item);
+		addHistory: (item, videoBlob) => {
+			history.add(item, videoBlob);
 			emit();
 		},
 		removeHistory: (id) => {
 			history.remove(id);
+			if (resident?.id === id) clearResident();
 			emit();
 		},
 		removeOldestHistory: (count) => {
 			history.removeOldest(count);
+			const rid = resident?.id ?? null;
+			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
 			emit();
 		},
 		clearHistory: () => {
 			history.clear();
+			const rid = resident?.id ?? null;
+			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
 			emit();
 		},
+		setResident: async (id) => {
+			if (resident?.id === id) return;
+			const blob = await history.loadVideoBlob(id);
+			if (!blob) return;
+			if (resident) URL.revokeObjectURL(resident.url);
+			resident = { id, blob, url: URL.createObjectURL(blob) };
+			emit();
+		},
+		residentId: () => (resident ? resident.id : null),
+		residentUrl: () => (resident ? resident.url : null),
+		residentBlob: () => (resident ? resident.blob : null),
 		setApiBase: (value) => {
 			const normalized = writeApiBase(value);
 			state.apiBase = getApiBase();
@@ -245,6 +272,10 @@ export function createStore(): Store {
 		fetchCapabilities,
 	};
 
-	void history.load().then(() => emit());
+	void history.load().then(() => {
+		emit();
+		const newest = history.items().at(-1);
+		if (newest) void store.setResident(newest.id);
+	});
 	return store;
 }

@@ -4,7 +4,7 @@
 
 import { getConfigurableBase } from "./config.js";
 import { h, clear, type Child } from "./dom.js";
-import { downloadDataUrl } from "./download.js";
+import { downloadBlob, downloadDataUrl } from "./download.js";
 import { setupFavicon } from "./favicon.js";
 import { estimateStorage } from "./history.js";
 import { pump } from "./queue.js";
@@ -268,15 +268,23 @@ export function mount(store: Store, root: HTMLElement): void {
 		} else if (action === "view-video") {
 			event.stopPropagation();
 			const id = actionEl.getAttribute("data-id") ?? "";
-			const src = actionEl.getAttribute("src") ?? "";
-			const isVideo = actionEl instanceof HTMLVideoElement;
 			const item = store.history.items().find((i) => i.id === id);
-			const filename = item ? mediaDownloadName(item) : `${id || "media"}.${isVideo ? "webm" : "webp"}`;
-			if (src) lightbox = { kind: isVideo ? "video" : "image", src, filename };
-			renderLightbox();
+			const filename = item ? mediaDownloadName(item) : `${id || "media"}.webm`;
+			void (async () => {
+				await store.setResident(id);
+				const src = store.residentUrl();
+				if (src) lightbox = { kind: "video", src, filename };
+				renderLightbox();
+			})();
 		} else if (action === "download-lightbox") {
 			event.stopPropagation();
-			if (lightbox) downloadDataUrl(lightbox.src, lightbox.filename);
+			if (!lightbox) return;
+			if (lightbox.kind === "video") {
+				const blob = store.residentBlob();
+				if (blob) downloadBlob(blob, lightbox.filename);
+			} else {
+				downloadDataUrl(lightbox.src, lightbox.filename);
+			}
 		} else if (action === "close-lightbox") {
 			lightbox = null;
 			renderLightbox();
@@ -305,7 +313,7 @@ export function mount(store: Store, root: HTMLElement): void {
 
 	function historySig(): string {
 		// Intentionally excludes the selection so opening a detail view does not rebuild (and restart playback of) the gallery videos.
-		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt).join(",");
+		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt).join(",") + `;resident:${store.residentId()}`;
 	}
 
 	function renderQueueSection(): void {
@@ -339,11 +347,9 @@ export function mount(store: Store, root: HTMLElement): void {
 		renderStorageModal();
 	}
 
-	store.subscribe(render);
-	render();
-
 	// Pause list videos once they scroll out of view so many completed items do not all decode simultaneously.
 	// Visible ones keep their native autoplay.
+	// Declared before the first render() call below so renderHistorySection can observe media without hitting a temporal-dead-zone error.
 	const listObserver = new IntersectionObserver(
 		(entries) => {
 			for (const entry of entries) {
@@ -362,6 +368,9 @@ export function mount(store: Store, root: HTMLElement): void {
 		listObserver.disconnect();
 		scope.querySelectorAll("video.row-media").forEach((v) => listObserver.observe(v));
 	};
+
+	store.subscribe(render);
+	render();
 
 	// Update live elapsed timers in place (does not rebuild video elements).
 	setInterval(() => updateElapsed(store), 1000);
@@ -580,12 +589,21 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0): HTML
 
 /** Emit history rows newest-first (immediately below the active queue row). */
 function buildHistoryRows(store: Store): HTMLElement[] {
-	return [...store.history.items()].reverse().map(buildHistoryRow);
+	const residentId = store.residentId();
+	const residentUrl = store.residentUrl();
+	return [...store.history.items()].reverse().map((item) => {
+		const isResident = item.id === residentId && item.video.mime.startsWith("video/") && !!residentUrl;
+		return buildHistoryRow(item, isResident, isResident ? residentUrl : null);
+	});
 }
 
-function buildHistoryRow(item: HistoryItem): HTMLElement {
-	const src = mediaSrc(item);
-	const media = item.video.mime === "image/webp" ? h("img", { class: "row-media", src, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id }) : h("video", { class: "row-media", src, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
+function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
+	let media: HTMLElement;
+	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
+		media = h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
+	} else {
+		media = h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id });
+	}
 
 	return h("li", { class: "job-row history" }, [
 		media,
@@ -630,10 +648,6 @@ function buildHistoryRow(item: HistoryItem): HTMLElement {
 	]);
 }
 
-function mediaSrc(item: HistoryItem): string {
-	return `data:${item.video.mime};base64,${item.video.b64}`;
-}
-
 /** The uploaded zip's filename with its trailing .zip extension stripped, or "" when absent. */
 function zipStem(name: string | null): string {
 	return name?.replace(/\.zip$/i, "") ?? "";
@@ -653,9 +667,9 @@ function mediaDownloadName(item: HistoryItem): string {
 const PIE_COLORS = ["#5b8cff", "#e6b45c", "#4cc38a", "#e0605f", "#c678dd", "#7aa3b0"];
 
 function historyItemBytes(item: HistoryItem): number {
-	const video = item.video.b64.length;
+	const video = item.video.byteSize;
 	const files = item.files.reduce((n, f) => n + f.dataUrl.length, 0);
-	return Math.round(((video + files) * 3) / 4);
+	return Math.round((files * 3) / 4) + video;
 }
 
 function drawStoragePie(canvas: HTMLCanvasElement, slices: { value: number; color: string }[], usage: number, quota: number): void {
