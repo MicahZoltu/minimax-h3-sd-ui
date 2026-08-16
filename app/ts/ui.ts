@@ -8,6 +8,7 @@ import { downloadBlob, downloadDataUrl } from "./download.js";
 import { setupFavicon } from "./favicon.js";
 import { estimateStorage } from "./history.js";
 import { pump } from "./queue.js";
+import { GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
 import { FALLBACK_DIMS } from "./state.js";
 import type { HistoryItem, QueueItem } from "./types.js";
@@ -17,6 +18,11 @@ import { analyzeZip, buildSourceZip } from "./zip.js";
 const isHTMLElement = (el: unknown): el is HTMLElement => el instanceof HTMLElement;
 const isInputElement = (el: unknown): el is HTMLInputElement => el instanceof HTMLInputElement;
 const isVideoElement = (el: unknown): el is HTMLVideoElement => el instanceof HTMLVideoElement;
+
+function frameDurationLabel(frames: number): string {
+	const seconds = frames / GENERATION_PRESET.fps;
+	return `≈ ${seconds.toFixed(1)} seconds`;
+}
 
 function requiredElement<T extends Element>(el: unknown, guard: (el: unknown) => el is T, what: string): T {
 	if (!guard(el)) throw new Error(`Required ${what} element is missing.`);
@@ -298,6 +304,21 @@ export function mount(store: Store, root: HTMLElement): void {
 			renderStorageModal();
 		}
 	});
+	// Hovering a history row's media preview makes that video the single resident one, unless the video modal is open.
+	app.addEventListener(
+		"mouseover",
+		(event) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) return;
+			// Keep the resident video stable while the video/player modal is open.
+			if (lightbox) return;
+			const media = target.closest('.row-media[data-action="view-video"]');
+			if (!media) return;
+			const id = media.getAttribute("data-id") ?? "";
+			if (id) void store.setResident(id);
+		},
+		true,
+	);
 
 	function renderForm(): void {
 		clear(formEl);
@@ -483,7 +504,7 @@ function buildForm(store: Store): HTMLElement {
 		h("div", { class: "dims" }, [
 			dimField("Width", "width", f.width, "width"),
 			dimField("Height", "height", f.height, "height"),
-			dimField("Frames", "frames", f.frames, "frames"),
+			dimField("Frames", "frames", f.frames, "frames", frameDurationLabel(f.frames)),
 			dimField("Steps", "steps", f.steps, "steps"),
 		]),
 		h("div", { class: "actions" }, [
@@ -497,7 +518,7 @@ function buildForm(store: Store): HTMLElement {
 	]);
 }
 
-function dimField(label: string, name: string, value: number, aria: string): HTMLElement {
+function dimField(label: string, name: string, value: number, aria: string, hint?: string): HTMLElement {
 	return h("label", { class: "field" }, [
 		h("span", {}, label),
 		h("input", {
@@ -509,6 +530,7 @@ function dimField(label: string, name: string, value: number, aria: string): HTM
 			"data-dim": name,
 			"aria-label": aria,
 		}),
+		hint ? h("span", { class: "field-hint", "data-dim-hint": name }, hint) : null,
 	]);
 }
 
@@ -835,10 +857,13 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 		if (!name) return;
 		const value = Number(target.value);
 		if (!Number.isFinite(value)) return;
-		if (name === "width") store.state.form.width = value;
-		else if (name === "height") store.state.form.height = value;
-		else if (name === "frames") store.state.form.frames = value;
-		else if (name === "steps") store.state.form.steps = value;
+		if (name === "width" || name === "height" || name === "frames" || name === "steps") {
+			store.setFormDim(name, value);
+			if (name === "frames") {
+				const hint = root.querySelector('[data-dim-hint="frames"]');
+				if (hint) hint.textContent = frameDurationLabel(value);
+			}
+		}
 	});
 }
 

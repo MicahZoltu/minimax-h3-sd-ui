@@ -5,9 +5,53 @@
 import { getCapabilities, type Capabilities } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
 import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
-import { createHistoryStore, createQueuePersistence, detectSyncStorage } from "./history.js";
+import { createHistoryStore, createQueuePersistence, detectSyncStorage, type SyncStorage } from "./history.js";
 import { createIdbHistory } from "./idb.js";
 import { GENERATION_PRESET } from "./request.js";
+
+const FORM_STORAGE_KEY = "sdcpp.video.formDims";
+
+interface SavedFormDims {
+	width: number;
+	height: number;
+	frames: number;
+	steps: number;
+}
+
+function readSavedFormDims(storage: SyncStorage | null): SavedFormDims | null {
+	if (!storage) return null;
+	try {
+		const raw = storage.getItem(FORM_STORAGE_KEY);
+		if (!raw) return null;
+		const v: unknown = JSON.parse(raw);
+		if (typeof v !== "object" || v === null) return null;
+		try {
+			const o = v as Record<string, unknown>;
+			const width = o["width"];
+			const height = o["height"];
+			const frames = o["frames"];
+			const steps = o["steps"];
+			if (typeof width !== "number" || !Number.isFinite(width) || width <= 0) return null;
+			if (typeof height !== "number" || !Number.isFinite(height) || height <= 0) return null;
+			if (typeof frames !== "number" || !Number.isFinite(frames) || frames <= 0) return null;
+			if (typeof steps !== "number" || !Number.isFinite(steps) || steps <= 0) return null;
+			return { width, height, frames, steps };
+		} catch {
+			return null;
+		}
+	} catch {
+		return null;
+	}
+}
+
+function writeSavedFormDims(storage: SyncStorage | null, dims: SavedFormDims): void {
+	if (!storage) return;
+	try {
+		storage.setItem(FORM_STORAGE_KEY, JSON.stringify(dims));
+	} catch {
+		// Best-effort; ignore.
+	}
+}
 
 // Keys of QueueItem, used to apply partial patches without untyped casts.
 const QUEUE_KEYS = [
@@ -84,6 +128,7 @@ export interface Store {
 	residentUrl(): string | null;
 	residentBlob(): Blob | null;
 	setForm(patch: Partial<NewJobForm>): void;
+	setFormDim(field: "width" | "height" | "frames" | "steps", value: number): void;
 	/**
 	 * Set a new API base; throws on invalid input.
 	 * Reconnects on success.
@@ -122,6 +167,15 @@ export function createStore(): Store {
 	const history = createHistoryStore(createIdbHistory());
 	const queuePersistence = createQueuePersistence(storage);
 	state.queue = queuePersistence.load();
+	let hadSavedDims = false;
+	const savedDims = readSavedFormDims(storage);
+	if (savedDims) {
+		state.form.width = savedDims.width;
+		state.form.height = savedDims.height;
+		state.form.frames = savedDims.frames;
+		state.form.steps = savedDims.steps;
+		hadSavedDims = true;
+	}
 	let resident: { id: string; blob: Blob; url: string } | null = null;
 
 	// Revision counters: the UI re-renders a region only when its counter changes, which keeps background polling from rebuilding the form and stealing focus while the user is typing.
@@ -155,7 +209,7 @@ export function createStore(): Store {
 			emit();
 			const v = caps.defaults_by_mode?.vid_gen;
 			const f = state.form;
-			if (!f.analysis) {
+			if (!f.analysis && !hadSavedDims) {
 				// Width/height come from server defaults when available; frames and steps keep the app defaults (107 / preset steps).
 				state.form.width = v?.width ?? FALLBACK_DIMS.width;
 				state.form.height = v?.height ?? FALLBACK_DIMS.height;
@@ -181,6 +235,16 @@ export function createStore(): Store {
 			Object.assign(state.form, patch);
 			revs.form += 1;
 			emit();
+		},
+		setFormDim: (field, value) => {
+			state.form[field] = value;
+			hadSavedDims = true;
+			writeSavedFormDims(storage, {
+				width: state.form.width,
+				height: state.form.height,
+				frames: state.form.frames,
+				steps: state.form.steps,
+			});
 		},
 		pushQueue: (item) => {
 			state.queue.unshift(item);
