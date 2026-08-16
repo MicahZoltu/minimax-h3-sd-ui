@@ -55,6 +55,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	let lastHistorySig = "";
 	let lastFormRev = -1;
 	let lastQueueRev = -1;
+	let lastResidentId = store.residentId();
 
 	let storageModalOpen = false;
 	let lastEstimate: { usage: number; quota: number } | null = null;
@@ -498,8 +499,8 @@ export function mount(store: Store, root: HTMLElement): void {
 	}
 
 	function historySig(): string {
-		// Intentionally excludes the selection so opening a detail view does not rebuild (and restart playback of) the gallery videos.
-		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt).join(",") + `;resident:${store.residentId()}`;
+		// Intentionally excludes the resident selection so a resident change does not rebuild (and restart playback of) the gallery videos.
+		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt).join(",");
 	}
 
 	function renderQueueSection(): void {
@@ -529,7 +530,13 @@ export function mount(store: Store, root: HTMLElement): void {
 		if (sig !== lastHistorySig) {
 			lastHistorySig = sig;
 			renderHistorySection();
+		} else {
+			const nextResidentId = store.residentId();
+			if (nextResidentId !== lastResidentId) {
+				swapResidentMedia(lastResidentId, nextResidentId);
+			}
 		}
+		lastResidentId = store.residentId();
 		renderStorageModal();
 	}
 
@@ -553,6 +560,23 @@ export function mount(store: Store, root: HTMLElement): void {
 	const observeListMedia = (scope: HTMLElement) => {
 		listObserver.disconnect();
 		scope.querySelectorAll("video.row-media").forEach((v) => listObserver.observe(v));
+	};
+	// Swap the resident <video> between rows in place, so an expanded prompt <details> on any other row survives the change.
+	// Only the previous row's media becomes a thumbnail and the new row's media becomes the autoplay video; nothing else is re-rendered.
+	const swapResidentMedia = (previousId: string | null, nextId: string | null): void => {
+		const swapRow = (id: string | null, asResident: boolean): void => {
+			if (id === null) return;
+			const item = store.history.items().find((i) => i.id === id);
+			if (!item) return;
+			const media = historyRowsEl.querySelector(`.row-media[data-id="${CSS.escape(id)}"]`);
+			const row = maybeElement(media ? media.closest("li.job-row.history") : null, isHTMLElement);
+			if (!row || !media) return;
+			const replacement = buildRowMedia(item, asResident, asResident ? store.residentUrl() : null);
+			row.replaceChild(replacement, media);
+		};
+		swapRow(previousId, false);
+		swapRow(nextId, true);
+		observeListMedia(historyRowsEl);
 	};
 
 	store.subscribe(render);
@@ -784,13 +808,15 @@ function buildHistoryRows(store: Store): HTMLElement[] {
 	});
 }
 
-function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
-	let media: HTMLElement;
+function buildRowMedia(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
 	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
-		media = h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
-	} else {
-		media = h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id });
+		return h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
 	}
+	return h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id });
+}
+
+function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
+	const media = buildRowMedia(item, isResident, residentUrl);
 
 	return h("li", { class: "job-row history" }, [
 		media,
