@@ -6,13 +6,16 @@
 	"type": "module",
 	"scripts": {
 		"serve": "bun scripts/serve.mjs",
-		"build": "tsc -p tsconfig.build.json",
+		"build": "bun run vendor && tsc -p tsconfig.build.json",
 		"test": "bun test",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"vendor": "bun scripts/vendor-mediabunny.mjs",
+		"postinstall": "bun run vendor"
 	},
 	"devDependencies": {
-		"typescript": "5.9.3",
+		"@types/bun": "1.3.14",
 		"@types/node": "22.20.1",
-		"@types/bun": "1.3.14"
+		"mediabunny": "1.54.0",
+		"typescript": "5.9.3"
 	}
 }
