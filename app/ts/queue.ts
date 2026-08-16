@@ -44,7 +44,12 @@ export function resumeActiveJobs(store: Store): void {
 }
 
 function nextPending(store: Store): QueueItem | undefined {
-	return store.state.queue.find((i) => i.status === "queued");
+	// The array is newest-first (pushQueue unshifts), so the oldest queued item sits last and runs next (FIFO).
+	for (let i = store.state.queue.length - 1; i >= 0; i--) {
+		const item = store.state.queue[i];
+		if (item && item.status === "queued") return item;
+	}
+	return undefined;
 }
 
 /**
