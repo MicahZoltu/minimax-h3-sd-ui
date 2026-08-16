@@ -3,6 +3,9 @@
 // No markup is ever built from unescaped strings, so uploaded prompts / file names are always safe.
 
 import { getConfigurableBase } from "./config.js";
+import { planLabel } from "./compression.plan.js";
+import { probeCompression, runCompression, type CompressionRun } from "./compression.js";
+import type { CompressionPlan, UnsupportedReason } from "./compression.types.js";
 import { h, clear, type Child } from "./dom.js";
 import { downloadBlob, downloadDataUrl } from "./download.js";
 import { setupFavicon } from "./favicon.js";
@@ -205,25 +208,174 @@ export function mount(store: Store, root: HTMLElement): void {
 
 	// Lightbox: click the media preview or an input thumbnail anywhere in the list to view it enlarged, shrunk to fit the viewport.
 	// Clicking the backdrop closes it.
-	let lightbox: { kind: "image" | "video"; src: string; filename: string } | null = null;
+	// The compressed plan/reason are filled in asynchronously by a probe once a video opens; until then the button stays disabled.
+	interface LightboxState {
+		kind: "image" | "video";
+		src: string;
+		filename: string;
+		stem: string;
+		plan: CompressionPlan | null;
+		reason: UnsupportedReason | null;
+	}
+	let lightbox: LightboxState | null = null;
 	const renderLightbox = (): void => {
 		clear(lightboxEl);
 		if (!lightbox) {
 			lightboxEl.style.display = "none";
 			return;
 		}
+		const lb = lightbox;
+		// The bar always reads "Download • Download Compressed • Close".
+		// Cancellation does not live here: a transient progress row (bar + Cancel) is managed imperatively below and exists only while a compression is running.
+		const barChildren: Child[] = [h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download")];
+		if (lb.kind === "video") {
+			const plan = lb.plan;
+			const ready = plan !== null;
+			// Informational tooltip: the plan label once a probe resolves, or a helpful note while disabled/unavailable.
+			const title = plan !== null ? planLabel(plan) : "Compression not available in this browser";
+			barChildren.push(
+				h("button", { class: "btn", "data-action": "download-compressed", disabled: !ready, title: title }, "Download Compressed"),
+			);
+		}
+		barChildren.push(h("button", { class: "btn", "data-action": "close-lightbox" }, "Close"));
 		lightboxEl.style.display = "block";
 		lightboxEl.appendChild(
 			h("div", { class: "overlay lightbox-overlay" }, [
-				lightbox.kind === "video"
-					? h("video", { class: "lightbox-media", src: lightbox.src, controls: true, playsinline: true, autoplay: true })
-					: h("img", { class: "lightbox-media", src: lightbox.src, alt: "Enlarged media" }),
-				h("div", { class: "lightbox-bar" }, [
-					h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download"),
-					h("button", { class: "btn", "data-action": "close-lightbox" }, "Close"),
+				// Column wrapper lets the button bar and progress row span the wider of the media or bar, centered like the rest of the lightbox.
+				h("div", { class: "lightbox-column" }, [
+					lb.kind === "video"
+						? h("video", { class: "lightbox-media", src: lb.src, controls: true, playsinline: true, autoplay: true })
+						: h("img", { class: "lightbox-media", src: lb.src, alt: "Enlarged media" }),
+					h("div", { class: "lightbox-bar" }, barChildren),
 				]),
 			]),
 		);
+	};
+	// Probe the resident blob once (idempotently) when a video lightbox opens, then enable the compress button if a plan is viable.
+	// Stale results (the lightbox changed or closed meanwhile) are ignored.
+	const probeVideoCompression = async (store: Store, lb: LightboxState): Promise<void> => {
+		const blob = store.residentBlob();
+		if (!blob) return;
+		try {
+			const outcome = await probeCompression(blob);
+			if (lightbox !== lb || lightbox.kind !== "video") return;
+			lightbox = { ...lightbox, plan: outcome.plan, reason: outcome.reason };
+			renderLightbox();
+		} catch {
+			if (lightbox !== lb || lightbox.kind !== "video") return;
+			lightbox = { ...lightbox, plan: null, reason: null };
+			renderLightbox();
+		}
+	};
+	// The compression currently running from the lightbox, if any.
+	// While this is set the lightbox is locked: closing and backdrop dismissal are refused and the download/close buttons are disabled.
+	// The delegated Cancel handler nulls this so the awaiting run's completion/cancellation bookkeeping is skipped.
+	let activeCompression: CompressionRun | null = null;
+	// Progress row is managed imperatively (not rebuilt by renderLightbox):
+	// renderLightbox re-renders the <video>, which would restart playback, so the row must be added/updated/removed directly in place around a single render.
+	let progressRowEl: HTMLElement | null = null;
+	let progressFillEl: HTMLElement | null = null;
+	let progressTextEl: HTMLElement | null = null;
+	let transientTimer: ReturnType<typeof setTimeout> | null = null;
+	const lightboxColumn = (): HTMLElement | null => maybeElement(lightboxEl.querySelector(".lightbox-column"), isHTMLElement);
+	const setLightboxControlsDisabled = (disabled: boolean): void => {
+		for (const action of ["download-lightbox", "download-compressed", "close-lightbox"]) {
+			const el = maybeElement(lightboxEl.querySelector(`[data-action="${action}"]`), isHTMLElement);
+			if (el) el.toggleAttribute("disabled", disabled);
+		}
+	};
+	const appendProgressRow = (): void => {
+		const column = lightboxColumn();
+		if (!column || progressRowEl) return;
+		const fill = h("div", { class: "lightbox-progress-fill", "data-compression-fill": "" });
+		const text = h("span", { class: "lightbox-progress-text", "data-compression-text": "" }, "0%");
+		const row = h("div", { class: "lightbox-progress" }, [
+			h("div", { class: "lightbox-progress-track" }, [fill]),
+			text,
+			h("button", { class: "btn small", "data-action": "cancel-compression" }, "Cancel"),
+		]);
+		column.appendChild(row);
+		progressRowEl = row;
+		progressFillEl = fill;
+		progressTextEl = text;
+	};
+	const removeProgressRow = (): void => {
+		progressRowEl?.remove();
+		progressRowEl = null;
+		progressFillEl = null;
+		progressTextEl = null;
+	};
+	const setProgress = (pct: number): void => {
+		if (progressFillEl) progressFillEl.style.width = `${pct * 100}%`;
+		if (progressTextEl) progressTextEl.textContent = `${Math.round(pct * 100)}%`;
+	};
+	const clearTransient = (): void => {
+		if (transientTimer != null) {
+			clearTimeout(transientTimer);
+			transientTimer = null;
+		}
+		lightboxEl.querySelector(".lightbox-message")?.remove();
+	};
+	const showTransientError = (message: string): void => {
+		clearTransient();
+		const column = lightboxColumn();
+		if (!column) return;
+		const node = h("div", { class: "lightbox-message", role: "alert" }, message);
+		column.appendChild(node);
+		transientTimer = setTimeout(() => node.remove(), 3500);
+	};
+	// Re-enable the locked controls and drop the progress row (which only ever exists for the duration of a run).
+	const unlockAfterCompression = (): void => {
+		removeProgressRow();
+		setLightboxControlsDisabled(false);
+	};
+	// Cancel helper: stops the active run, then unlocks the lightbox.
+	// Stale cancellations (lightbox changed/closed meanwhile) are handled gracefully by the guards: a run that no longer owns the slot does no bookkeeping.
+	const cancelCompressionFromLightbox = (): void => {
+		const run = activeCompression;
+		if (!run) return;
+		activeCompression = null;
+		run.cancel();
+		unlockAfterCompression();
+	};
+	// Run the compression for the currently-open video lightbox, drive the transient progress row, and hand the result to the browser on completion.
+	const runCompressionFromLightbox = async (store: Store): Promise<void> => {
+		const lb = lightbox;
+		if (!lb || lb.kind !== "video" || lb.plan === null) return;
+		if (activeCompression) return;
+		const blob = store.residentBlob();
+		if (!blob) return;
+		const plan = lb.plan;
+		// Lock the lightbox: disable the two download buttons and Close, and (via activeCompression) refuse backdrop dismissal and Close clicks.
+		clearTransient();
+		appendProgressRow();
+		setLightboxControlsDisabled(true);
+		setProgress(0);
+		const run = runCompression(blob, plan, { quality: "medium", stem: lb.stem });
+		activeCompression = run;
+		run.onProgress((pct) => {
+			if (activeCompression === run) setProgress(pct);
+		});
+		try {
+			const result = await run.done;
+			if (activeCompression !== run) return;
+			setProgress(1);
+			downloadBlob(result.blob, result.filename);
+			// Let the 100% readout paint for a beat before the row is removed and the controls re-enable.
+			setTimeout(() => {
+				if (activeCompression === run) {
+					activeCompression = null;
+					unlockAfterCompression();
+				}
+			}, 180);
+		} catch (err) {
+			if (activeCompression !== run) return;
+			// A canceled run reports "Compression canceled."; that is handled as a clean unlock, not an error.
+			const canceled = err instanceof Error && err.message === "Compression canceled.";
+			if (!canceled) showTransientError(`Compression failed: ${err instanceof Error ? err.message : String(err)}`);
+			activeCompression = null;
+			unlockAfterCompression();
+		}
 	};
 	const lookupImage = (id: string, name: string): string | null => {
 		const inQueue = store.state.queue.find((i) => i.id === id)?.files.find((f) => f.name === name);
@@ -256,8 +408,9 @@ export function mount(store: Store, root: HTMLElement): void {
 			renderStorageModal();
 			return;
 		}
-		// Clicking the overlay backdrop closes the lightbox.
+		// Clicking the overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
 		if (target.classList.contains("overlay")) {
+			if (activeCompression) return;
 			lightbox = null;
 			renderLightbox();
 			return;
@@ -269,19 +422,29 @@ export function mount(store: Store, root: HTMLElement): void {
 			event.stopPropagation();
 			const name = actionEl.getAttribute("data-name") ?? "";
 			const src = lookupImage(actionEl.getAttribute("data-id") ?? "", name) ?? actionEl.getAttribute("src") ?? "";
-			if (src) lightbox = { kind: "image", src, filename: name || "image" };
+			if (src) lightbox = { kind: "image", src, filename: name || "image", stem: "", plan: null, reason: null };
 			renderLightbox();
 		} else if (action === "view-video") {
 			event.stopPropagation();
 			const id = actionEl.getAttribute("data-id") ?? "";
 			const item = store.history.items().find((i) => i.id === id);
 			const filename = item ? mediaDownloadName(item) : `${id || "media"}.webm`;
+			const stem = item ? (zipStem(item.zipName) || sanitizeBasename(item.prompt) || item.id) : id;
 			void (async () => {
 				await store.setResident(id);
 				const src = store.residentUrl();
-				if (src) lightbox = { kind: "video", src, filename };
-				renderLightbox();
+				if (src) {
+					lightbox = { kind: "video", src, filename, stem, plan: null, reason: null };
+					renderLightbox();
+					void probeVideoCompression(store, lightbox);
+				}
 			})();
+		} else if (action === "download-compressed") {
+			event.stopPropagation();
+			void runCompressionFromLightbox(store);
+		} else if (action === "cancel-compression") {
+			event.stopPropagation();
+			cancelCompressionFromLightbox();
 		} else if (action === "download-lightbox") {
 			event.stopPropagation();
 			if (!lightbox) return;
@@ -292,6 +455,8 @@ export function mount(store: Store, root: HTMLElement): void {
 				downloadDataUrl(lightbox.src, lightbox.filename);
 			}
 		} else if (action === "close-lightbox") {
+			// Closing is refused while a compression runs; the Close button is also disabled during that window.
+			if (activeCompression) return;
 			lightbox = null;
 			renderLightbox();
 		} else if (action === "open-storage") {

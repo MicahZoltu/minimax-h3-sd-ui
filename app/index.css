@@ -510,12 +510,21 @@ body {
 /* ---- lightbox (click-to-enlarge an input image at native size) ---- */
 .lightbox-overlay {
 	z-index: 40;
+}
+
+/* Column wrapper hugs the widest child (media or button bar) so the action bar and progress row span the larger width, and everything stays centered in the overlay. */
+.lightbox-column {
+	display: flex;
 	flex-direction: column;
+	align-items: stretch;
+	width: fit-content;
+	max-width: 100%;
 	gap: 12px;
 }
 
 .lightbox-media {
 	display: block;
+	align-self: flex-start;
 	width: auto;
 	height: auto;
 	max-width: calc(100vw - 48px);
@@ -528,6 +537,49 @@ body {
 	display: flex;
 	gap: 8px;
 	justify-content: center;
+	width: 100%;
+}
+
+/* The transient progress row: the bar expands to fill available space and Cancel stays fixed-width. */
+.lightbox-progress {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	width: 100%;
+}
+
+.lightbox-progress-track {
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 8px;
+	border-radius: 999px;
+	background: var(--panel-2);
+	border: 1px solid var(--border);
+	overflow: hidden;
+}
+
+.lightbox-progress-fill {
+	height: 100%;
+	width: 0;
+	background: var(--accent);
+	transition: width 0.15s;
+}
+
+.lightbox-progress-text {
+	min-width: 40px;
+	text-align: right;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.lightbox-message {
+	font-size: 13px;
+	color: var(--bad);
+	background: rgba(224, 96, 95, 0.12);
+	border: 1px solid rgba(224, 96, 95, 0.4);
+	border-radius: 6px;
+	padding: 8px 12px;
+	text-align: center;
 }
 
 /* ---- overlay / detail ---- */
