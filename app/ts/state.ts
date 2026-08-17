@@ -5,8 +5,8 @@
 import { getCapabilities, type Capabilities } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
 import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
-import { createHistoryStore, createQueuePersistence, detectSyncStorage, type SyncStorage } from "./history.js";
-import { createIdbHistory } from "./idb.js";
+import { createHistoryStore, detectSyncStorage, type QueueBackend, type SyncStorage } from "./history.js";
+import { createIdbHistory, createIdbQueue } from "./idb.js";
 import { GENERATION_PRESET } from "./request.js";
 
 const FORM_STORAGE_KEY = "sdcpp.video.formDims";
@@ -113,6 +113,8 @@ export interface Store {
 	/** Monotonic revision counters used by the UI to re-render only what changed. */
 	revs: Revisions;
 	history: ReturnType<typeof createHistoryStore>;
+	/** Resolves once the initial queue load from the persisted backend has completed. */
+	queueReady: Promise<void>;
 	subscribe(fn: () => void): () => void;
 	emit(): void;
 	pushQueue(item: QueueItem): void;
@@ -143,7 +145,7 @@ export interface Store {
 	fetchCapabilities(): Promise<void>;
 }
 
-export function createStore(): Store {
+export function createStore(queueBackend: QueueBackend = createIdbQueue()): Store {
 	const listeners = new Set<() => void>();
 	const state: AppState = {
 		caps: null,
@@ -165,8 +167,16 @@ export function createStore(): Store {
 	};
 	const storage = detectSyncStorage();
 	const history = createHistoryStore(createIdbHistory());
-	const queuePersistence = createQueuePersistence(storage);
-	state.queue = queuePersistence.load();
+	// The in-memory queue starts empty and is hydrated asynchronously from the IndexedDB backend.
+	// queueReady resolves once that initial load lands, so startup can await it before resuming jobs.
+	let resolveQueueReady: () => void = () => {};
+	const queueReady = new Promise<void>((resolve) => {
+		resolveQueueReady = resolve;
+	});
+	// Counts in-memory queue mutations; hydration only applies the loaded snapshot when none happened
+	// while the load was in flight, so a fast user action is never clobbered by a stale read.
+	let queueWrites = 0;
+	const queueWritesAtStart = 0;
 	let hadSavedDims = false;
 	const savedDims = readSavedFormDims(storage);
 	if (savedDims) {
@@ -226,6 +236,7 @@ export function createStore(): Store {
 		state,
 		revs,
 		history,
+		queueReady,
 		subscribe: (fn) => {
 			listeners.add(fn);
 			return () => listeners.delete(fn);
@@ -249,8 +260,10 @@ export function createStore(): Store {
 		pushQueue: (item) => {
 			state.queue.unshift(item);
 			revs.queue += 1;
+			queueWrites += 1;
 			emit();
-			queuePersistence.save(state.queue);
+			// Mutate in-memory synchronously (the UI source of truth), persist best-effort in the background.
+			void queueBackend.save(state.queue);
 		},
 		patchQueueItem: (id, patch) => {
 			const item = state.queue.find((i) => i.id === id);
@@ -266,8 +279,9 @@ export function createStore(): Store {
 			if (changed) {
 				Object.assign(item, patch);
 				revs.queue += 1;
+				queueWrites += 1;
 				emit();
-				queuePersistence.save(state.queue);
+				void queueBackend.save(state.queue);
 			}
 		},
 		removeQueue: (id) => {
@@ -275,8 +289,9 @@ export function createStore(): Store {
 			if (idx < 0) return;
 			state.queue.splice(idx, 1);
 			revs.queue += 1;
+			queueWrites += 1;
 			emit();
-			queuePersistence.save(state.queue);
+			void queueBackend.save(state.queue);
 		},
 		moveQueue: (from, to) => {
 			const q = state.queue;
@@ -285,7 +300,8 @@ export function createStore(): Store {
 			if (item === undefined) return;
 			q.splice(to, 0, item);
 			revs.queue += 1;
-			queuePersistence.save(state.queue);
+			queueWrites += 1;
+			void queueBackend.save(state.queue);
 			emit();
 		},
 		addHistory: (item, videoBlob) => {
@@ -341,5 +357,19 @@ export function createStore(): Store {
 		const newest = history.items().at(-1);
 		if (newest) void store.setResident(newest.id);
 	});
+
+	// Hydrate the queue from the persisted backend. The load is best-effort (never throws): when the
+	// backend is unavailable it resolves to an empty queue and the session is queue-only-like-memory.
+	void (async () => {
+		const loaded = await queueBackend.load();
+		// Only surface the persisted snapshot if nothing was mutated while it was loading, so an early
+		// user action is never clobbered by a stale read (load is typically faster than user input).
+		if (queueWrites === queueWritesAtStart) {
+			state.queue = loaded;
+			revs.queue += 1;
+			emit();
+		}
+		resolveQueueReady();
+	})();
 	return store;
 }

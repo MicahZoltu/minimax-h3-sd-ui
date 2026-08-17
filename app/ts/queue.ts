@@ -130,7 +130,7 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 		}
 
 		if (job.status === "completed") {
-			void handleCompleted(store, itemId, job);
+			await handleCompleted(store, itemId, job);
 			return;
 		}
 		if (job.status === "failed") {

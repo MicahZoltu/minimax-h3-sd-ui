@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
-import { createHistoryStore, createQueuePersistence, estimateStorage, isHistoryItem, type HistoryBackend, type SyncStorage } from "../app/ts/history.js";
+import { createHistoryStore, estimateStorage, isHistoryItem, isQueueItem, type HistoryBackend } from "../app/ts/history.js";
+import { memoryQueueBackend } from "./support/queueBackend.js";
 import type { HistoryItem, QueueItem } from "../app/ts/types.js";
 
 function makeQueueItem(partial: Partial<QueueItem> = {}): QueueItem {
@@ -40,29 +41,6 @@ function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 		video: { mime: "video/webm", format: "webm", byteSize: 3 },
 		persisted: false,
 		...overrides,
-	};
-}
-
-function memoryStorage(limitBytes = Infinity): SyncStorage {
-	const data = new Map<string, string>();
-	let total = 0;
-	return {
-		getItem: (k) => data.get(k) ?? null,
-		keys: () => [...data.keys()],
-		setItem: (k, v) => {
-			const delta = v.length - (data.get(k)?.length ?? 0);
-			if (total + delta > limitBytes) {
-				const e = new DOMException("Quota exceeded", "QuotaExceededError");
-				throw e;
-			}
-			total += delta;
-			data.set(k, v);
-		},
-		removeItem: (k) => {
-			const v = data.get(k);
-			if (v) total -= v.length;
-			data.delete(k);
-		},
 	};
 }
 
@@ -119,15 +97,13 @@ function validatingBackend(): HistoryBackend & { setData(entries: unknown[]): vo
 
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
-describe("createQueuePersistence", () => {
-	it("round-trips a queue through a fake storage", () => {
-		const storage = memoryStorage();
-		const save = createQueuePersistence(storage);
+describe("QueueBackend", () => {
+	it("round-trips a queue through the async backend", async () => {
+		const backend = memoryQueueBackend();
 		const queue = [makeQueueItem(), makeQueueItem({ status: "generating", serverId: "srv" })];
-		save.save(queue);
+		await backend.save(queue);
 
-		const load = createQueuePersistence(storage);
-		const loaded = load.load();
+		const loaded = await backend.load();
 		expect(loaded.length).toBe(2);
 		expect(loaded[0]?.id).toBe(queue[0]?.id);
 		expect(loaded[0]?.prompt).toBe("a dog");
@@ -136,31 +112,20 @@ describe("createQueuePersistence", () => {
 		expect(loaded[1]?.serverId).toBe("srv");
 	});
 
-	it("rejects garbage payloads by returning an empty queue", () => {
-		const storage = memoryStorage();
-		storage.setItem("sdcpp.video.queue", "{not json");
-		expect(createQueuePersistence(storage).load()).toEqual([]);
-
-		storage.setItem("sdcpp.video.queue", JSON.stringify({ id: "x" }));
-		expect(createQueuePersistence(storage).load()).toEqual([]);
-
-		storage.setItem("sdcpp.video.queue", JSON.stringify([{ id: "x" }]));
-		expect(createQueuePersistence(storage).load()).toEqual([]);
-	});
-
-	it("strips items missing required fields from a mixed payload", () => {
-		const storage = memoryStorage();
+	it("isQueueItem rejects items missing required fields so a mixed payload strips them", async () => {
 		const good = makeQueueItem();
-		storage.setItem("sdcpp.video.queue", JSON.stringify([good, { id: "bad" }]));
-		const loaded = createQueuePersistence(storage).load();
+		const backend = memoryQueueBackend();
+		backend.seed([good, { id: "bad" } as unknown as QueueItem]);
+		const loaded = await backend.load();
 		expect(loaded.length).toBe(1);
 		expect(loaded[0]?.id).toBe(good.id);
+		expect(isQueueItem({ id: "x" })).toBe(false);
 	});
 
-	it("no-ops when there is no storage", () => {
-		const queuePersistence = createQueuePersistence(null);
-		expect(queuePersistence.load()).toEqual([]);
-		expect(() => queuePersistence.save([makeQueueItem()])).not.toThrow();
+	it("never throws on load or save", async () => {
+		const backend = memoryQueueBackend();
+		await expect(backend.save([makeQueueItem()])).resolves.toBeUndefined();
+		await expect(backend.load()).resolves.toBeDefined();
 	});
 });
 

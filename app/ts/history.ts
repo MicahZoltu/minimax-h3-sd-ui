@@ -5,7 +5,7 @@
 // If persistence is unavailable (private browsing) or a write fails, items are kept in memory only (`persisted === false`).
 // This module never throws to the rest of the app.
 //
-// This module also owns the queue persistence (a small JSON payload in localStorage) and the storage-usage estimator.
+// This module also owns the queue persistence backend contract and the storage-usage estimator.
 
 import type { HistoryItem, QueueItem, QueueStatus } from "./types.js";
 
@@ -20,14 +20,13 @@ export interface SyncStorage {
 	keys(): string[];
 }
 
-const QUEUE_KEY = "sdcpp.video.queue";
 // Soft cap on in-memory items (each holds a full video) so an extended session cannot grow memory without bound.
 // Eviction drops items from the resident list only; the persisted archive is never pruned by this cap.
 const MAX_IN_MEMORY = 100;
 
 const QUEUE_STATUSES: QueueStatus[] = ["queued", "submitting", "generating", "completed", "failed", "cancelled"];
 
-function isQueueItem(value: unknown): value is QueueItem {
+export function isQueueItem(value: unknown): value is QueueItem {
 	if (typeof value !== "object" || value === null) return false;
 	if (!("id" in value) || !("status" in value) || !("prompt" in value)) return false;
 	if (typeof value.id !== "string") return false;
@@ -161,49 +160,11 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 	};
 }
 
-export interface QueuePersistence {
-	load(): QueueItem[];
-	save(queue: QueueItem[]): void;
-}
-
-/**
- * Persist the entire generation queue under one key so queued and in-progress (generating/submitting) items survive a page refresh.
- * The queue holds input file data URLs but no video bytes, so a single writes stays comfortably within storage quota.
- * When storage is unavailable the queue is session-only, mirroring history's degrade-to-memory behaviour.
- */
-export function createQueuePersistence(storage: SyncStorage | null): QueuePersistence {
-	if (!storage) {
-		return {
-			load: () => [],
-			save: () => {
-				// No backend: nothing to write.
-			},
-		};
-	}
-	return {
-		load(): QueueItem[] {
-			try {
-				const raw = storage.getItem(QUEUE_KEY);
-				if (!raw) return [];
-				const parsed: unknown = JSON.parse(raw);
-				if (!Array.isArray(parsed)) return [];
-				return parsed.filter(isQueueItem);
-			} catch {
-				return [];
-			}
-		},
-		save(queue: QueueItem[]): void {
-			try {
-				if (queue.length > 0) {
-					storage.setItem(QUEUE_KEY, JSON.stringify(queue));
-				} else {
-					storage.removeItem(QUEUE_KEY);
-				}
-			} catch {
-				// A failed write (quota, security) should never break generation; the queue is simply not persisted.
-			}
-		},
-	};
+export interface QueueBackend {
+	/** Return every persisted item, or an empty array on any failure. */
+	load(): Promise<QueueItem[]>;
+	/** Best-effort persist the whole queue; never throws. */
+	save(items: QueueItem[]): Promise<void>;
 }
 
 export interface StorageEstimate {
