@@ -2,7 +2,7 @@
 // This is the single source of truth the UI renders from; generation logic mutates it and emits change notifications.
 // Nothing here touches the network or storage backend directly -- that lives in api.ts / history.ts.
 
-import { getCapabilities, type Capabilities } from "./api.js";
+import { getCapabilities, supportsVideoProgress, type Capabilities, type JobProgress } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
 import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
 import { createHistoryStore, detectSyncStorage, type QueueBackend, type SyncStorage } from "./history.js";
@@ -10,6 +10,14 @@ import { createIdbHistory, createIdbQueue } from "./idb.js";
 import { GENERATION_PRESET } from "./request.js";
 
 const FORM_STORAGE_KEY = "sdcpp.video.formDims";
+
+/**
+ * Shown when the connected server does not advertise video generation progress.
+ * Set once the server is known to be online but missing the feature, and used both to surface a
+ * clear connect-time error in the UI and to refuse to start generation without the feature.
+ */
+export const VIDEO_PROGRESS_ERROR =
+	"The attached server is missing the generation-progress feature, which this UI requires. Please serve from a stable-diffusion.cpp examples/server that reports video generation progress.";
 
 interface SavedFormDims {
 	width: number;
@@ -93,6 +101,10 @@ export interface AppState {
 	caps: Capabilities | null;
 	online: boolean;
 	capsError: string | null;
+	/** True when the server advertises generation progress for video jobs. */
+	vidProgress: boolean;
+	/** Non-null when the server is online but does not advertise video generation progress. */
+	progressError: string | null;
 	/** Resolved API base URL currently used by the client. */
 	apiBase: string;
 	/** The base used when no override is configured. */
@@ -119,6 +131,12 @@ export interface Store {
 	emit(): void;
 	pushQueue(item: QueueItem): void;
 	patchQueueItem(id: string, patch: Partial<QueueItem>): void;
+	/**
+	 * Record the latest generation progress for a running item.
+	 * Unlike patchQueueItem it is in-memory only: it neither bumps the queue revision (so frequent
+	 * polls do not rebuild the list) nor persists, because progress is transient and changes every poll.
+	 */
+	setQueueProgress(id: string, progress: JobProgress): void;
 	removeQueue(id: string): void;
 	moveQueue(from: number, to: number): void;
 	addHistory(item: HistoryItem, videoBlob: Blob): void;
@@ -151,6 +169,8 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		caps: null,
 		online: false,
 		capsError: null,
+		vidProgress: false,
+		progressError: null,
 		apiBase: getApiBase(),
 		defaultApiBase: getDefaultBase(),
 		queue: [],
@@ -215,6 +235,8 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.caps = caps;
 			state.online = true;
 			state.capsError = null;
+			state.vidProgress = supportsVideoProgress(caps);
+			state.progressError = state.vidProgress ? null : VIDEO_PROGRESS_ERROR;
 			state.apiBase = getApiBase();
 			emit();
 			const v = caps.defaults_by_mode?.vid_gen;
@@ -227,6 +249,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		} catch (err) {
 			state.online = false;
 			state.capsError = err instanceof Error ? err.message : String(err);
+			state.progressError = null;
 			emit();
 		}
 	};
@@ -283,6 +306,14 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 				emit();
 				void queueBackend.save(state.queue);
 			}
+		},
+		setQueueProgress: (id, progress) => {
+			const item = state.queue.find((i) => i.id === id);
+			if (!item) return;
+			// Skip work when the value is unchanged so emit() fires only on an actual update.
+			if (item.progress && item.progress.step === progress.step && item.progress.steps === progress.steps) return;
+			item.progress = progress;
+			emit();
 		},
 		removeQueue: (id) => {
 			const idx = findIndex(id);

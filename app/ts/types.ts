@@ -1,5 +1,7 @@
 // Shared domain types for the video-only UI.
 
+import type { JobProgress } from "./api.js";
+
 export type ZipMode = "prompt" | "start-end" | "refs";
 
 /** An image file extracted from an uploaded zip (start/end/ref frame). */
@@ -40,6 +42,11 @@ export interface QueueItem {
 	serverId: string | null;
 	/** Epoch ms of server-reported start, if any. */
 	startedAt: number | null;
+	/**
+	 * Latest generation progress observed while `status === "generating"`.
+	 * Transient: only held in memory and never persisted, so it may be missing after a hydration reload.
+	 */
+	progress?: JobProgress | null;
 }
 
 export interface VideoData {

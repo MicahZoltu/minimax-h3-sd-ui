@@ -4,7 +4,7 @@
 // This module advances it one item at a time: it submits the next pending item to the server, polls the job until it reaches a terminal state, records a completed item into history, then automatically advances to the next queued item.
 // Only one server job is in-flight from this browser at a time.
 
-import { ApiError, getJob, submitVideoJob } from "./api.js";
+import { ApiError, getJob, isJobProgress, submitVideoJob } from "./api.js";
 import type { Job } from "./api.js";
 import { buildVidGenRequest, mimeForFormat, GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
@@ -66,6 +66,11 @@ export async function pump(store: Store): Promise<void> {
 }
 
 async function runItem(store: Store, item: QueueItem): Promise<void> {
+	// The UI requires generation progress; refuse to run on a server that does not report it.
+	if (store.state.progressError) {
+		store.patchQueueItem(item.id, { status: "failed", error: store.state.progressError });
+		return;
+	}
 	const body = buildVidGenRequest(item);
 	store.patchQueueItem(item.id, { status: "submitting", startedAt: null, error: null });
 
@@ -127,6 +132,9 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 
 		if (job.started) {
 			store.patchQueueItem(itemId, { startedAt: job.started * 1000 });
+		}
+		if (job.status === "generating" && isJobProgress(job.progress)) {
+			store.setQueueProgress(itemId, job.progress);
 		}
 
 		if (job.status === "completed") {

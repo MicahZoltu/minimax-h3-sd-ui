@@ -15,6 +15,25 @@ export interface Capabilities {
 			output_compression?: number;
 		};
 	};
+	features_by_mode?: {
+		img_gen?: { progress?: boolean };
+		vid_gen?: { progress?: boolean };
+	};
+}
+
+/**
+ * Generation progress reported by the server while a job is `generating`.
+ * `step`/`steps` describe the current diffusion call, not a monotonic overall percentage:
+ * hires/tiling and per-frame (AnimateDiff) jobs reset the counter, and post-processing runs
+ * after the final sampling call, so the bar is an indication of activity more than exact completion.
+ */
+export interface JobProgress {
+	/** Current step of the running generation call, 1-based. */
+	step: number;
+	/** Total steps in the current generation call. */
+	steps: number;
+	/** Seconds per iteration (elapsed time of the most recent step, not total elapsed). */
+	time: number;
 }
 
 export interface Job {
@@ -35,6 +54,8 @@ export interface Job {
 	} | null;
 	error?: { code?: string; message?: string } | null;
 	poll_url?: string;
+	/** Present only while `status === "generating"`; null otherwise. */
+	progress?: JobProgress | null;
 }
 
 import { getApiBase } from "./config.js";
@@ -100,6 +121,17 @@ function isJob(value: unknown): value is Job {
 	if (value === null || typeof value !== "object") return false;
 	if (!("id" in value) || !("status" in value)) return false;
 	return typeof value.id === "string" && typeof value.status === "string";
+}
+
+export function isJobProgress(value: unknown): value is JobProgress {
+	if (value === null || typeof value !== "object") return false;
+	const v = value as Record<string, unknown>;
+	return typeof v["step"] === "number" && typeof v["steps"] === "number" && typeof v["time"] === "number";
+}
+
+/** True when the server advertises generation progress for the video (vid_gen) mode. */
+export function supportsVideoProgress(caps: Capabilities): boolean {
+	return Boolean(caps.features_by_mode?.vid_gen?.progress);
 }
 
 export async function getCapabilities(): Promise<Capabilities> {

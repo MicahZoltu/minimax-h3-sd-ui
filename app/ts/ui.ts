@@ -14,6 +14,7 @@ import { pump } from "./queue.js";
 import { GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
 import { FALLBACK_DIMS } from "./state.js";
+import type { JobProgress } from "./api.js";
 import type { HistoryItem, QueueItem } from "./types.js";
 import { dataUrlToBytes, formatElapsed, sanitizeBasename, uid } from "./utils.js";
 import { analyzeZip, buildSourceZip } from "./zip.js";
@@ -131,7 +132,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	const storageFillEl = requiredElement(header.querySelector("[data-storage-fill]"), isHTMLElement, "storage fill");
 	const apiUrlEl = requiredElement(header.querySelector("[data-api-url]"), isHTMLElement, "api url");
 	const apiErrEl = maybeElement(header.querySelector("[data-api-err]"), isHTMLElement);
-	updateHeader(store, statusEl, storageEl, apiUrlEl);
+	updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
 	let apiEditing = false;
 	let apiErrTimer: ReturnType<typeof setTimeout> | null = null;
 	const hideApiError = (): void => {
@@ -517,7 +518,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	}
 
 	function render(): void {
-		updateHeader(store, statusEl, storageEl, apiUrlEl);
+		updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
 		if (store.revs.form !== lastFormRev) {
 			lastFormRev = store.revs.form;
 			renderForm();
@@ -582,8 +583,8 @@ export function mount(store: Store, root: HTMLElement): void {
 	store.subscribe(render);
 	render();
 
-	// Update live elapsed timers in place (does not rebuild video elements).
-	setInterval(() => updateElapsed(store), 1000);
+	// Update live elapsed timers and progress bars in place (does not rebuild video elements).
+	setInterval(() => updateLive(store), 1000);
 	// Refresh the quota meter on a throttled cadence (StorageManager estimates are best-effort).
 	refreshStorageMeter();
 	setInterval(() => void refreshStorageMeter(), 2000);
@@ -616,8 +617,17 @@ function buildHeader(): HTMLElement {
 	]);
 }
 
-function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElement, apiUrlEl: HTMLElement): void {
-	if (store.state.online) {
+function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElement, apiUrlEl: HTMLElement, apiErrEl: HTMLElement | null): void {
+	if (store.state.progressError) {
+		// The server is reachable but lacks the feature this UI requires; surface that clearly rather than silently degrading.
+		statusEl.textContent = "Online";
+		statusEl.className = "status warn";
+		statusEl.title = store.state.progressError;
+		if (apiErrEl) {
+			apiErrEl.textContent = store.state.progressError;
+			apiErrEl.className = "api-err show";
+		}
+	} else if (store.state.online) {
 		statusEl.textContent = "Online";
 		statusEl.className = "status ok";
 	} else if (store.state.capsError) {
@@ -627,6 +637,10 @@ function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElemen
 	} else {
 		statusEl.textContent = "Connecting…";
 		statusEl.className = "status warn";
+	}
+	if (apiErrEl && !store.state.progressError) {
+		apiErrEl.className = "api-err";
+		apiErrEl.textContent = "";
 	}
 	// Don't clobber an in-progress URL edit.
 	if (!apiUrlEl.querySelector("input")) apiUrlEl.textContent = getConfigurableBase();
@@ -733,13 +747,14 @@ function buildQueueRows(store: Store): HTMLElement[] {
 	const active = q.filter((i) => i.status === "submitting" || i.status === "generating");
 
 	const rows: HTMLElement[] = [];
-	queued.forEach((item, index) => rows.push(buildQueueRow(item, index, queued.length)));
-	stuck.forEach((item) => rows.push(buildQueueRow(item)));
-	active.forEach((item) => rows.push(buildQueueRow(item)));
+	const progressOk = store.state.vidProgress;
+	queued.forEach((item, index) => rows.push(buildQueueRow(item, index, queued.length, progressOk)));
+	stuck.forEach((item) => rows.push(buildQueueRow(item, -1, 0, progressOk)));
+	active.forEach((item) => rows.push(buildQueueRow(item, -1, 0, progressOk)));
 	return rows;
 }
 
-function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0): HTMLElement {
+function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progressOk = false): HTMLElement {
 	const isQueued = item.status === "queued";
 	const isActive = item.status === "submitting" || item.status === "generating";
 	const chip = h("span", { class: `chip ${item.status}` }, statusLabel(item));
@@ -749,6 +764,11 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0): HTML
 		h("span", {}, `${item.width}×${item.height} · ${item.jobFrames}f · ${item.steps} steps`),
 		elapsed,
 	]);
+
+	const progress = item.status === "generating" && progressOk ? h("div", { class: "job-progress", "data-progress": item.id }, [
+		h("div", { class: "progress-track" }, [h("div", { class: "progress-fill", style: `width:${item.progress ? progressPercent(item.progress) : 0}%` })]),
+		h("span", { class: "progress-label" }, item.progress ? progressLabel(item.progress) : "Generating…"),
+	]) : null;
 
 	const promptBlock = h("details", { class: "prompt-block" }, [
 		h("summary", {}, "Prompt"),
@@ -791,6 +811,7 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0): HTML
 	const body: Child[] = [
 		h("div", { class: "row-head" }, [chip, h("div", { class: "row-title" }, truncate(itemTitle(item), 90))]),
 		meta,
+		...(progress ? [progress] : []),
 		promptBlock,
 	];
 	if (actions.length > 0) body.push(h("div", { class: "row-actions" }, actions));
@@ -1117,11 +1138,45 @@ function moveQueueItem(store: Store, id: string, delta: number): void {
 
 function updateElapsed(store: Store): void {
 	for (const item of store.state.queue) {
-		if (item.status === "generating" && item.startedAt != null) {
-			const el = document.querySelector(`[data-elapsed="${CSS.escape(item.id)}"]`);
-			if (el) el.textContent = formatElapsed(Date.now() - item.startedAt);
-		}
+		if (item.status !== "generating" || item.startedAt === null) continue;
+		const el = document.querySelector(`[data-elapsed="${CSS.escape(item.id)}"]`);
+		if (el) el.textContent = formatElapsed(Date.now() - item.startedAt);
 	}
+}
+
+function updateProgress(store: Store): void {
+	for (const item of store.state.queue) {
+		if (item.status !== "generating" || !item.progress) continue;
+		const root = document.querySelector(`[data-progress="${CSS.escape(item.id)}"]`);
+		if (!root) continue;
+		const fill = root.querySelector(".progress-fill");
+		const label = root.querySelector(".progress-label");
+		if (fill instanceof HTMLElement) fill.style.width = progressPercent(item.progress) + "%";
+		if (label) label.textContent = progressLabel(item.progress);
+	}
+}
+
+/** Refresh both live timers and progress bars in place (runs every second). */
+function updateLive(store: Store): void {
+	updateElapsed(store);
+	updateProgress(store);
+}
+
+function progressPercent(progress: JobProgress): number {
+	if (!Number.isFinite(progress.step) || !Number.isFinite(progress.steps) || progress.steps <= 0) return 0;
+	return Math.max(0, Math.min(100, (progress.step / progress.steps) * 100));
+}
+
+function stepSpeed(seconds: number): string | null {
+	if (!Number.isFinite(seconds) || seconds <= 0) return null;
+	// High throughput reads better as a per-second rate than as a tiny s/step figure.
+	if (seconds < 0.05) return `${(1 / seconds).toFixed(0)} steps/s`;
+	return `${seconds.toFixed(2)} s/step`;
+}
+
+function progressLabel(progress: JobProgress): string {
+	const speed = stepSpeed(progress.time);
+	return `Step ${progress.step} of ${progress.steps}${speed ? ` · ${speed}` : ""}`;
 }
 
 function statusLabel(item: QueueItem): string {
