@@ -3,31 +3,22 @@
 // The favicon is drawn onto a canvas and exposed as a data-URL <link rel="icon">.
 // The whole icon is a single max-size digit communicating two things at a glance:
 //   - its value is the number of jobs in flight (the currently generating item plus everything queued and not yet terminal), clamped to a single digit with "9+" for anything larger, and
-//   - its color is the unreviewed state (accent when a video completed since the tab was last looked at, muted otherwise).
+//   - its color is green (accent) whenever at least one completed generation has not been viewed, blue otherwise.
 //
-// A completion that lands while the tab is being looked at is considered seen immediately.
-// The unreviewed color is cleared the next time the tab becomes visible or the window regains focus.
+// "Viewed" is the persisted per-item `viewed` flag: a completion is highlighted in the list and the
+// favicon stays green until the user clicks a video thumbnail to view it.
 
 import type { Store } from "./state.js";
 
 export interface FaviconView {
-	/** Total completed videos kept in history; used to detect new completions. */
-	historyCount: number;
 	/** Jobs in flight: the generating item plus everything queued and not yet terminal. */
 	active: number;
-	/** Whether a video completed since the tab was last looked at. */
+	/** Whether at least one completed generation has not been viewed yet. */
 	unreviewed: boolean;
 }
 
-export function computeFaviconView(prev: FaviconView | null, historyCount: number, active: number, visible: boolean): FaviconView {
-	const completed = prev !== null && historyCount > prev.historyCount;
-	let unreviewed = prev?.unreviewed ?? false;
-	if (completed) {
-		unreviewed = visible ? false : true;
-	} else if (visible) {
-		unreviewed = false;
-	}
-	return { historyCount, active, unreviewed };
+export function computeFaviconView(active: number, hasUnviewed: boolean): FaviconView {
+	return { active, unreviewed: hasUnviewed };
 }
 
 const SIZE = 64;
@@ -65,24 +56,10 @@ let setUp = false;
 export function setupFavicon(store: Store): void {
 	if (setUp) return;
 	setUp = true;
-	let view: FaviconView | null = null;
-	let visible = document.visibilityState === "visible";
+	const hasUnviewed = (): boolean => store.history.items().some((i) => !i.viewed);
 	const inFlight = (): number =>
 		store.state.queue.reduce((n, i) => n + (i.status === "queued" || i.status === "submitting" || i.status === "generating" ? 1 : 0), 0);
-	const flush = (): void => {
-		view = computeFaviconView(view, store.history.items().length, inFlight(), visible);
-		paintFavicon(view);
-	};
-	store.subscribe(flush);
-	const onVisibility = (): void => {
-		visible = document.visibilityState === "visible";
-		flush();
-	};
-	const onFocus = (): void => {
-		visible = true;
-		flush();
-	};
-	document.addEventListener("visibilitychange", onVisibility);
-	window.addEventListener("focus", onFocus);
-	flush();
+	// Repaint on every store change: completion adds an unviewed item and viewing one removes it.
+	store.subscribe(() => paintFavicon(computeFaviconView(inFlight(), hasUnviewed())));
+	paintFavicon(computeFaviconView(inFlight(), hasUnviewed()));
 }

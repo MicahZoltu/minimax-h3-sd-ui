@@ -195,6 +195,7 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 		thumbnail,
 		video: { mime, format, byteSize: videoBlob.size },
 		persisted: false,
+		viewed: false,
 	};
 
 	store.addHistory(historyItem, videoBlob);

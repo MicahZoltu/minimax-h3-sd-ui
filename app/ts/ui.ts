@@ -432,6 +432,8 @@ export function mount(store: Store, root: HTMLElement): void {
 			const item = store.history.items().find((i) => i.id === id);
 			const filename = item ? mediaDownloadName(item) : `${id || "media"}.webm`;
 			const stem = item ? (zipStem(item.zipName) || sanitizeBasename(item.prompt) || item.id) : id;
+			// Opening the full video clears this item's "new" highlight (and its green favicon contribution).
+			store.markHistoryViewed(id);
 			void (async () => {
 				await store.setResident(id);
 				const src = store.residentUrl();
@@ -501,7 +503,8 @@ export function mount(store: Store, root: HTMLElement): void {
 
 	function historySig(): string {
 		// Intentionally excludes the resident selection so a resident change does not rebuild (and restart playback of) the gallery videos.
-		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt).join(",");
+		// Includes `viewed` so opening a video clears its "new" highlight.
+		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt + ":" + (i.viewed ? "1" : "0")).join(",");
 	}
 
 	function renderQueueSection(): void {
@@ -839,7 +842,7 @@ function buildRowMedia(item: HistoryItem, isResident: boolean, residentUrl: stri
 function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
 	const media = buildRowMedia(item, isResident, residentUrl);
 
-	return h("li", { class: "job-row history" }, [
+	return h("li", { class: item.viewed ? "job-row history" : "job-row history new" }, [
 		media,
 		h("div", { class: "row-body" }, [
 			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),

@@ -140,6 +140,8 @@ export interface Store {
 	removeQueue(id: string): void;
 	moveQueue(from: number, to: number): void;
 	addHistory(item: HistoryItem, videoBlob: Blob): void;
+	/** Mark a completed history item as viewed (clears its "new" highlight and favicon contribution). */
+	markHistoryViewed(id: string): void;
 	removeHistory(id: string): void;
 	removeOldestHistory(count: number): void;
 	clearHistory(): void;
@@ -337,6 +339,10 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		},
 		addHistory: (item, videoBlob) => {
 			history.add(item, videoBlob);
+			emit();
+		},
+		markHistoryViewed: (id) => {
+			history.markViewed(id);
 			emit();
 		},
 		removeHistory: (id) => {

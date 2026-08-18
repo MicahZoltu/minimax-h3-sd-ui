@@ -382,6 +382,11 @@ body {
 	gap: 12px;
 }
 
+.job-row.history.new {
+	border-left: 3px solid var(--good);
+	background: linear-gradient(90deg, rgba(76, 195, 138, 0.08), transparent 40%), var(--panel-2);
+}
+
 #historyRows.divider {
 	border-top: 1px solid var(--border);
 	padding-top: 10px;

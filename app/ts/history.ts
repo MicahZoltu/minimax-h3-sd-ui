@@ -61,6 +61,8 @@ export interface HistoryBackend {
 	/** Return every persisted item, or an empty array on any failure. */
 	loadAll(): Promise<HistoryItem[]>;
 	save(item: HistoryItem, videoBlob: Blob): Promise<void>;
+	/** Update only the persisted history record (not the media blob), e.g. when an item is marked viewed. */
+	update(item: HistoryItem): Promise<void>;
 	remove(id: string): Promise<void>;
 	clear(): Promise<void>;
 	loadVideoBlob(id: string): Promise<Blob | null>;
@@ -69,6 +71,8 @@ export interface HistoryBackend {
 export interface HistoryStore {
 	items(): HistoryItem[];
 	add(item: HistoryItem, videoBlob: Blob): void;
+	/** Mark an item viewed (persist best-effort); a no-op when it is already viewed. */
+	markViewed(id: string): void;
 	remove(id: string): void;
 	removeOldest(count: number): void;
 	clear(): void;
@@ -113,6 +117,8 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 						const seen = new Set(items.map((i) => i.id));
 						for (const item of remote) {
 							item.persisted = true;
+							// Legacy persisted items predate the `viewed` flag; treat them as already seen.
+							item.viewed = item.viewed === false ? false : true;
 							if (!seen.has(item.id)) items.push(item);
 						}
 						items.sort((a, b) => a.createdAt - b.createdAt);
@@ -132,6 +138,16 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		loadVideoBlob(id: string): Promise<Blob | null> {
 			if (!backend) return Promise.resolve(null);
 			return backend.loadVideoBlob(id);
+		},
+		markViewed(id: string): void {
+			const item = items.find((i) => i.id === id);
+			if (!item || item.viewed) return;
+			item.viewed = true;
+			if (backend) {
+				backend.update(item).catch(() => {
+					// Best-effort: only the persisted flag may be stale; the running list is already updated.
+				});
+			}
 		},
 		remove(id: string): void {
 			const idx = items.findIndex((i) => i.id === id);

@@ -48,6 +48,23 @@ function onRequest(request: IDBRequest): Promise<unknown> {
 	});
 }
 
+function updateHistoryRecord(item: HistoryItem): Promise<void> {
+	return database().then((db) => {
+		if (!db) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			try {
+				const tx = db.transaction(HISTORY_STORE, "readwrite");
+				tx.objectStore(HISTORY_STORE).put(item);
+				tx.oncomplete = () => resolve();
+				tx.onerror = () => resolve();
+				tx.onabort = () => resolve();
+			} catch {
+				resolve();
+			}
+		});
+	});
+}
+
 function runWrite(run: (history: IDBObjectStore, media: IDBObjectStore) => void): Promise<void> {
 	return database().then((db) => {
 		if (!db) return Promise.resolve();
@@ -89,6 +106,7 @@ export function createIdbHistory(): HistoryBackend {
 				void media.put(videoBlob, item.id);
 			});
 		},
+		update: updateHistoryRecord,
 		async remove(id: string): Promise<void> {
 			await runWrite((history, media) => {
 				void history.delete(id);

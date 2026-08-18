@@ -40,6 +40,7 @@ function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 		thumbnail: "",
 		video: { mime: "video/webm", format: "webm", byteSize: 3 },
 		persisted: false,
+		viewed: false,
 		...overrides,
 	};
 }
@@ -53,6 +54,10 @@ function memoryBackend(): HistoryBackend & { data(): HistoryItem[] } {
 		},
 		async save(item, _videoBlob) {
 			data.push(item);
+		},
+		async update(item) {
+			const i = data.findIndex((x) => x.id === item.id);
+			if (i >= 0) data[i] = item;
 		},
 		async remove(id) {
 			const i = data.findIndex((x) => x.id === id);
@@ -84,6 +89,7 @@ function validatingBackend(): HistoryBackend & { setData(entries: unknown[]): vo
 			return out;
 		},
 		async save(_item, _videoBlob) {},
+		async update() {},
 		async remove() {},
 		async clear() {},
 		async loadVideoBlob(_id) {
@@ -155,6 +161,33 @@ describe("createHistoryStore", () => {
 		await flush();
 		expect(item.persisted).toBe(true);
 		expect(backend.data().some((i) => i.id === item.id)).toBe(true);
+	});
+
+	it("starts items unviewed and markViewed flips them, persisting the flag", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const a = makeItem();
+		const b = makeItem();
+		store.add(a, new Blob([]));
+		store.add(b, new Blob([]));
+		await flush();
+		expect(store.items().every((i) => i.viewed === false)).toBe(true);
+
+		store.markViewed(a.id);
+		expect(store.items().find((i) => i.id === a.id)?.viewed).toBe(true);
+		expect(store.items().find((i) => i.id === b.id)?.viewed).toBe(false);
+		await flush();
+		expect(backend.data().find((i) => i.id === a.id)?.viewed).toBe(true);
+	});
+
+	it("treats legacy persisted items without a viewed flag as already viewed on rehydrate", async () => {
+		const backend = validatingBackend();
+		// Simulate a record written before the `viewed` flag existed.
+		const { viewed: _viewed, ...legacy } = makeItem();
+		backend.setData([legacy]);
+		const store = createHistoryStore(backend);
+		await store.load();
+		expect(store.items().every((i) => i.viewed === true)).toBe(true);
 	});
 
 	it("rehydrates persisted history into a new store via load()", async () => {

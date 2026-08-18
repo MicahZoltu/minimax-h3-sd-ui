@@ -84,4 +84,10 @@ export interface HistoryItem {
 	video: VideoData;
 	/** Whether this item is persisted to localStorage. */
 	persisted: boolean;
+	/**
+	 * Whether the completed video has been opened (clicked to show the full video).
+	 * New completions start `false` (highlighted + green favicon) and are flipped when viewed.
+	 * Old persisted items without the field are treated as already viewed.
+	 */
+	viewed: boolean;
 }
