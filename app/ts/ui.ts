@@ -502,9 +502,10 @@ export function mount(store: Store, root: HTMLElement): void {
 	}
 
 	function historySig(): string {
-		// Intentionally excludes the resident selection so a resident change does not rebuild (and restart playback of) the gallery videos.
+		// Intentionally excludes the resident selection (so a resident change does not rebuild/restart playback) and `persisted`
+		// (which flips asynchronously on save, so including it would manufacture a second unnecessary history reconcile).
 		// Includes `viewed` so opening a video clears its "new" highlight.
-		return store.history.items().map((i) => i.id + ":" + i.persisted + ":" + i.createdAt + ":" + (i.viewed ? "1" : "0")).join(",");
+		return store.history.items().map((i) => `${i.id}:${i.createdAt}:${i.viewed ? "1" : "0"}`).join(",");
 	}
 
 	function renderQueueSection(): void {
@@ -513,9 +514,36 @@ export function mount(store: Store, root: HTMLElement): void {
 		updateListEmpty();
 	}
 
+	// Reconcile the history list in place rather than clearing and rebuilding every row.
+	// A completion must add a single row and a view must remove a single highlight, without tearing down
+	// the other ~N rows (each of which embeds a large base64 thumbnail) — a full rebuild caused the post-generation studders.
 	function renderHistorySection(): void {
-		clear(historyRowsEl);
-		for (const row of buildHistoryRows(store)) historyRowsEl.appendChild(row);
+		const items = [...store.history.items()].reverse();
+		const existing = new Map<string, HTMLElement>();
+		for (const row of historyRowsEl.querySelectorAll<HTMLElement>("li.job-row.history")) {
+			existing.set(row.getAttribute("data-id") ?? "", row);
+		}
+		const wanted = new Set(items.map((i) => i.id));
+		for (const [id, row] of existing) {
+			if (!wanted.has(id)) row.remove();
+		}
+		// Reconcile in display (newest-first) order: insert missing rows in place, move rows that shifted, and toggle the "new" highlight in place.
+		let prev: HTMLElement | null = null;
+		for (const item of items) {
+			let row = existing.get(item.id);
+			if (!row) {
+				row = buildHistoryRow(item);
+				historyRowsEl.insertBefore(row, prev ? prev.nextSibling : historyRowsEl.firstChild);
+			} else {
+				row.classList.toggle("new", !item.viewed);
+				if (prev && row !== prev.nextSibling) {
+					historyRowsEl.insertBefore(row, prev.nextSibling);
+				} else if (!prev && row !== historyRowsEl.firstChild) {
+					historyRowsEl.insertBefore(row, historyRowsEl.firstChild);
+				}
+			}
+			prev = row;
+		}
 		observeListMedia(historyRowsEl);
 		updateListEmpty();
 	}
@@ -534,13 +562,11 @@ export function mount(store: Store, root: HTMLElement): void {
 		if (sig !== lastHistorySig) {
 			lastHistorySig = sig;
 			renderHistorySection();
-		} else {
-			const nextResidentId = store.residentId();
-			if (nextResidentId !== lastResidentId) {
-				swapResidentMedia(lastResidentId, nextResidentId);
-			}
 		}
-		lastResidentId = store.residentId();
+		// The resident change is always applied in place on the single affected row, whether or not the signature changed.
+		const nextResidentId = store.residentId();
+		if (nextResidentId !== lastResidentId) swapResidentMedia(lastResidentId, nextResidentId);
+		lastResidentId = nextResidentId;
 		renderStorageModal();
 	}
 
@@ -688,7 +714,7 @@ function buildForm(store: Store): HTMLElement {
 							h("span", { class: "key" }, "images"),
 							h("div", { class: "thumbs" },
 								f.analysis.files.map((file) =>
-									h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name }),
+									h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, decoding: "async", "data-action": "view-image", "data-name": file.name }),
 								)),
 						])
 					  : null,
@@ -773,23 +799,10 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progr
 		h("span", { class: "progress-label" }, item.progress ? progressLabel(item.progress) : "Generating…"),
 	]) : null;
 
-	const promptBlock = h("details", { class: "prompt-block" }, [
+	const promptBlock = h("details", { class: "prompt-block", "data-lazy-files": item.id, "data-files-kind": "queue" }, [
 		h("summary", {}, "Prompt"),
 		h("p", {}, item.prompt),
-		item.files.length > 0
-			? h("div", { class: "thumbs" },
-				  item.files.map((f) =>
-					  h("img", {
-						  class: "thumb",
-						  src: f.dataUrl,
-						  alt: f.name,
-						  title: f.name,
-						  "data-action": "view-image",
-						  "data-id": item.id,
-						  "data-name": f.name,
-					  }),
-				  ))
-			: null,
+		h("div", { class: "thumbs" }),
 		item.error ? h("p", { class: "item-error", role: "alert" }, item.error) : null,
 	]);
 
@@ -822,27 +835,19 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progr
 	return h("li", { class: `job-row queue ${item.status}` }, body);
 }
 
-/** Emit history rows newest-first (immediately below the active queue row). */
-function buildHistoryRows(store: Store): HTMLElement[] {
-	const residentId = store.residentId();
-	const residentUrl = store.residentUrl();
-	return [...store.history.items()].reverse().map((item) => {
-		const isResident = item.id === residentId && item.video.mime.startsWith("video/") && !!residentUrl;
-		return buildHistoryRow(item, isResident, isResident ? residentUrl : null);
-	});
-}
-
 function buildRowMedia(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
 	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
 		return h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
 	}
-	return h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, loading: "lazy", "data-action": "view-video", "data-id": item.id });
+	return h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, decoding: "async", loading: "lazy", "data-action": "view-video", "data-id": item.id });
 }
 
-function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
-	const media = buildRowMedia(item, isResident, residentUrl);
+// History rows always render their thumbnail (never the resident video); the resident <video> is attached in place by swapResidentMedia.
+// The resident id is attached to the <li> so renderHistorySection can reconcile rows by id without rebuilding them.
+function buildHistoryRow(item: HistoryItem): HTMLElement {
+	const media = buildRowMedia(item, false, null);
 
-	return h("li", { class: item.viewed ? "job-row history" : "job-row history new" }, [
+	return h("li", { class: item.viewed ? "job-row history" : "job-row history new", "data-id": item.id }, [
 		media,
 		h("div", { class: "row-body" }, [
 			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),
@@ -863,23 +868,10 @@ function buildHistoryRow(item: HistoryItem, isResident: boolean, residentUrl: st
 					}, "Delete"),
 				]),
 			]),
-			h("details", { class: "prompt-block" }, [
+			h("details", { class: "prompt-block", "data-lazy-files": item.id, "data-files-kind": "history" }, [
 				h("summary", {}, "Prompt"),
 				h("p", {}, item.prompt),
-				item.files.length > 0
-					? h("div", { class: "thumbs" },
-						  item.files.map((f) =>
-							  h("img", {
-								  class: "thumb",
-								  src: f.dataUrl,
-								  alt: f.name,
-								  title: f.name,
-								  "data-action": "view-image",
-								  "data-id": item.id,
-								  "data-name": f.name,
-							  }),
-						  ))
-					: null,
+				h("div", { class: "thumbs" }),
 			]),
 		]),
 	]);
@@ -1024,6 +1016,28 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 				break;
 		}
 	});
+	// Deferred <details> thumbs: fill the empty .thumbs container the first time a prompt block is opened.
+	// <details> rows are inserted/reordered by the keyed reconcile, but `toggle` bubbles, so delegation reaches them.
+	root.addEventListener("toggle", (event) => {
+		const el = event.target instanceof HTMLElement ? event.target.closest("details[data-lazy-files]") : null;
+		if (!(el instanceof HTMLDetailsElement) || !el.open) return;
+		const container = maybeElement(el.querySelector(".thumbs"), isHTMLElement);
+		if (!container || container.childElementCount > 0) return;
+		const id = el.getAttribute("data-lazy-files");
+		const kind = el.getAttribute("data-files-kind");
+		if (!id) return;
+		const files =
+			kind === "history"
+				? store.history.items().find((i) => i.id === id)?.files
+				: kind === "queue"
+					? store.state.queue.find((i) => i.id === id)?.files
+					: undefined;
+		if (!files || files.length === 0) return;
+		for (const file of files) {
+			container.appendChild(h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" }));
+		}
+	});
+
 	// Drop zone: open the picker on click (freshly query the re-rendered input).
 	root.addEventListener("click", (event) => {
 		const target = event.target;

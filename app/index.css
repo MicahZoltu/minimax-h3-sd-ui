@@ -380,6 +380,10 @@ body {
 	flex-direction: row;
 	align-items: center;
 	gap: 12px;
+	/* Skipped (offscreen) rows are not rendered or laid out, so give them a stable reserved height to avoid scroll collapse/shift.
+	   The collapsed row is roughly the 96px media thumb + padding, so 96px is a close estimate and self-corrects when rendered. */
+	content-visibility: auto;
+	contain-intrinsic-size: auto 96px;
 }
 
 .job-row.history.new {
