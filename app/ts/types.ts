@@ -57,6 +57,14 @@ export interface VideoData {
 	byteSize: number;
 }
 
+/** An image file persisted to IndexedDB. */
+export interface PersistedFile {
+	name: string;
+	key: string;
+	/** Exact byte size of the stored binary file (the persisted Blob's size). */
+	bytes: number;
+}
+
 export interface HistoryItem {
 	id: string;
 	/** Epoch ms when the item was created (client clock). */
@@ -65,7 +73,7 @@ export interface HistoryItem {
 	/** Original uploaded .zip filename, so a source-zip download can restore it. */
 	zipName: string | null;
 	mode: ZipMode;
-	files: ZipFile[];
+	files: PersistedFile[];
 	/** Final width used for generation (request value). */
 	width: number;
 	/** Final height used for generation (request value). */
@@ -79,8 +87,10 @@ export interface HistoryItem {
 	/** Epoch ms from the server. */
 	startedAt: number;
 	completedAt: number;
-	/** Small single-frame preview image (data URL). */
-	thumbnail: string;
+	/** Media store key for the small single-frame preview image. */
+	thumbnailKey: string;
+	/** Exact byte size of the stored binary thumbnail (the persisted Blob's size). */
+	thumbBytes: number;
 	video: VideoData;
 	/** Whether this item is persisted to localStorage. */
 	persisted: boolean;
@@ -91,3 +101,4 @@ export interface HistoryItem {
 	 */
 	viewed: boolean;
 }
+

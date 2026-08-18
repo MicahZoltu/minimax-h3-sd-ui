@@ -6,9 +6,11 @@
 
 import { ApiError, getJob, isJobProgress, submitVideoJob } from "./api.js";
 import type { Job } from "./api.js";
+import { dataUrlToBlob, fileKey, thumbnailKey } from "./media.js";
 import { buildVidGenRequest, mimeForFormat, GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
-import type { HistoryItem, QueueItem } from "./types.js";
+import { encodeThumbnail } from "./thumbnail.js";
+import type { HistoryItem, PersistedFile, QueueItem } from "./types.js";
 import { base64ToBytes, bytesToBlob, sleep, uid } from "./utils.js";
 
 export const POLL_MS = 1500;
@@ -36,7 +38,7 @@ export function resumeActiveJobs(store: Store): void {
 		if (item.status !== "submitting" && item.status !== "generating") continue;
 		if (item.serverId) {
 			// Continue the queue once the resumed job reaches a terminal state.
-			void pollUntilTerminal(store, item.id, item.serverId, "generation lost due to page refresh").then(() => void pump(store));
+			void pollUntilTerminal(store, item.id, item.serverId, "generation lost due to page refresh").then(() => void pump(store)).catch(() => {});
 		} else {
 			store.patchQueueItem(item.id, { status: "failed", error: "generation lost due to page refresh" });
 		}
@@ -165,12 +167,12 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 	const format = safeFormat(result.output_format);
 	const mime = mimeForFormat(format);
 	const videoBlob = bytesToBlob(base64ToBytes(b64), mime);
-	let thumbnail = "";
+	let thumbBlob: Blob;
 	try {
-		thumbnail = await captureVideoThumbnail(b64, mime, format);
+		thumbBlob = await captureVideoThumbnail(videoBlob, mime);
 	} catch {
 		// Thumbnail decode is best-effort; a missing preview must not fail the generation.
-		thumbnail = "";
+		thumbBlob = new Blob([], { type: "image/jpeg" });
 	}
 	const frameCount = result.frame_count !== undefined && Number.isFinite(result.frame_count) ? result.frame_count : item.jobFrames;
 	const fps = result.fps !== undefined && Number.isFinite(result.fps) ? result.fps : GENERATION_PRESET.fps;
@@ -178,13 +180,31 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 	const completedSec = job.completed ?? startedSec;
 	const elapsedMs = Math.max(0, completedSec - startedSec) * 1000;
 
+	const historyId = uid("h_");
+	// Convert the payload-bearing queue files to Blobs exactly once, so both the record's byte sizes and
+	// the persisted media match the bytes the thumbnail and store will resolve by key.
+	// A malformed dataUrl must not strand the completed item: a failed conversion records bytes 0 (and an
+	// empty Blob keeps index alignment) so the item still progresses out of the queue.
+	const fileBlobs: (Blob | null)[] = item.files.map((f) => {
+		try {
+			return dataUrlToBlob(f.dataUrl);
+		} catch {
+			return null;
+		}
+	});
+	const files: PersistedFile[] = item.files.map((f, index) => {
+		const blob = fileBlobs[index];
+		return { name: f.name, key: fileKey(historyId, index), bytes: blob ? blob.size : 0 };
+	});
+	const mediaFiles: Blob[] = fileBlobs.map((blob) => blob ?? new Blob([], { type: "application/octet-stream" }));
+
 	const historyItem: HistoryItem = {
-		id: uid("h_"),
+		id: historyId,
 		createdAt: Date.now(),
 		prompt: item.prompt,
 		zipName: item.zipName,
 		mode: item.mode,
-		files: item.files,
+		files,
 		width: item.width,
 		height: item.height,
 		frameCount,
@@ -192,24 +212,24 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 		elapsedMs,
 		startedAt: startedSec * 1000,
 		completedAt: completedSec * 1000,
-		thumbnail,
+		thumbnailKey: thumbnailKey(historyId),
+		thumbBytes: thumbBlob.size,
 		video: { mime, format, byteSize: videoBlob.size },
 		persisted: false,
 		viewed: false,
 	};
 
-	store.addHistory(historyItem, videoBlob);
+	store.addHistory(historyItem, { video: videoBlob, thumbnail: thumbBlob, files: mediaFiles });
 	store.removeQueue(itemId);
-	void store.setResident(historyItem.id);
+	void store.setResident(historyItem.id, videoBlob);
 }
 
-async function captureVideoThumbnail(b64: string, mime: string, _format: string): Promise<string> {
+async function captureVideoThumbnail(videoBlob: Blob, mime: string): Promise<Blob> {
 	// For image outputs (webp), the "video" is already a still; reuse it directly.
 	if (mime.startsWith("image/")) {
-		return `data:${mime};base64,${b64}`;
+		return videoBlob;
 	}
-	const blob = bytesToBlob(base64ToBytes(b64), mime);
-	const url = URL.createObjectURL(blob);
+	const url = URL.createObjectURL(videoBlob);
 	try {
 		const video = document.createElement("video");
 		video.src = url;
@@ -226,16 +246,16 @@ async function captureVideoThumbnail(b64: string, mime: string, _format: string)
 			if (video.readyState >= 2 || video.currentTime !== 0) { resolve(); return; }
 			video.addEventListener("seeked", () => resolve(), { once: true });
 		});
-		const scale = Math.min(1, 320 / video.videoWidth);
-		const w = Math.max(1, Math.round(video.videoWidth * scale));
-		const h = Math.max(1, Math.round(video.videoHeight * scale));
+		const width = video.videoWidth;
+		const height = video.videoHeight;
 		const canvas = document.createElement("canvas");
-		canvas.width = w;
-		canvas.height = h;
+		canvas.width = width;
+		canvas.height = height;
 		const ctx = canvas.getContext("2d");
 		if (!ctx) throw new Error("thumbnail canvas unavailable");
-		ctx.drawImage(video, 0, 0, w, h);
-		return canvas.toDataURL("image/jpeg", 0.7);
+		ctx.drawImage(video, 0, 0, width, height);
+		const imageData = ctx.getImageData(0, 0, width, height);
+		return await encodeThumbnail(imageData, 320, 0.7);
 	} finally {
 		URL.revokeObjectURL(url);
 	}

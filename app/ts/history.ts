@@ -7,6 +7,7 @@
 //
 // This module also owns the queue persistence backend contract and the storage-usage estimator.
 
+import { fileKey, thumbnailKey, videoKey } from "./media.js";
 import type { HistoryItem, QueueItem, QueueStatus } from "./types.js";
 
 export interface SyncStorage {
@@ -47,12 +48,16 @@ export function isQueueItem(value: unknown): value is QueueItem {
 
 export function isHistoryItem(value: unknown): value is HistoryItem {
 	if (typeof value !== "object" || value === null) return false;
-	if (!("id" in value) || !("createdAt" in value) || !("thumbnail" in value) || !("video" in value)) return false;
-	if (typeof value.id !== "string" || typeof value.createdAt !== "number" || typeof value.thumbnail !== "string") return false;
+	if (!("id" in value) || !("createdAt" in value) || !("thumbnailKey" in value) || !("thumbBytes" in value) || !("video" in value)) return false;
+	if (typeof value.id !== "string" || typeof value.createdAt !== "number" || typeof value.thumbnailKey !== "string" || typeof value.thumbBytes !== "number") return false;
 	const video = value.video;
 	if (typeof video !== "object" || video === null) return false;
 	if (!("mime" in video) || !("format" in video) || !("byteSize" in video)) return false;
-	return typeof video.mime === "string" && typeof video.format === "string" && typeof video.byteSize === "number" && ("zipName" in value) && (value.zipName === null || typeof value.zipName === "string");
+	if (typeof video.mime !== "string" || typeof video.format !== "string" || typeof video.byteSize !== "number") return false;
+	if (!("zipName" in value) || (value.zipName !== null && typeof value.zipName !== "string")) return false;
+	if (!("files" in value) || !Array.isArray(value.files)) return false;
+	if (value.files.some((f) => typeof f !== "object" || f === null || !("name" in f) || !("key" in f) || !("bytes" in f) || typeof f.name !== "string" || typeof f.key !== "string" || typeof f.bytes !== "number")) return false;
+	return true;
 }
 
 export interface HistoryBackend {
@@ -61,32 +66,65 @@ export interface HistoryBackend {
 	/** Return every persisted item, or an empty array on any failure. */
 	loadAll(): Promise<HistoryItem[]>;
 	save(item: HistoryItem, videoBlob: Blob): Promise<void>;
-	/** Update only the persisted history record (not the media blob), e.g. when an item is marked viewed. */
-	update(item: HistoryItem): Promise<void>;
+	/** Persist a single media Blob (thumbnail or input file) under its media-store key. */
+	storeMedia(key: string, blob: Blob): Promise<void>;
+	/** Update only an item's `viewed` field on the history object store key, not the whole record. */
+	setViewed(id: string, viewed: boolean): Promise<void>;
 	remove(id: string): Promise<void>;
 	clear(): Promise<void>;
-	loadVideoBlob(id: string): Promise<Blob | null>;
+	loadMedia(key: string): Promise<Blob | null>;
 }
 
 export interface HistoryStore {
 	items(): HistoryItem[];
-	add(item: HistoryItem, videoBlob: Blob): void;
+	add(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void;
 	/** Mark an item viewed (persist best-effort); a no-op when it is already viewed. */
 	markViewed(id: string): void;
 	remove(id: string): void;
 	removeOldest(count: number): void;
 	clear(): void;
 	isPersistent(): boolean;
-	loadVideoBlob(id: string): Promise<Blob | null>;
+	loadVideo(id: string): Promise<Blob | null>;
+	loadThumbnail(id: string): Promise<Blob | null>;
+	loadFile(id: string, index: number): Promise<Blob | null>;
+	/**
+	 * Load a persisted file Blob by its recorded media-store key (the authoritative index, from `file.key`).
+	 * Unlike loadFile(id, index), this does not re-derive the key from a renumbered array position, so it cannot
+	 * miss a blob when a record's file keys are not contiguous with its array indexes (e.g. after a legacy migration).
+	 */
+	loadFileByKey(key: string): Promise<Blob | null>;
 	/** Hydrate persisted history into memory; resolves when items() reflects the backend. */
 	load(): Promise<void>;
 }
 
 export function createHistoryStore(backend: HistoryBackend | null): HistoryStore {
 	const items: HistoryItem[] = [];
+	// In-memory byte cache keyed by media-store key.
+	// It backs the non-persistent path (private browsing / failed writes must still show images) and
+	// serves repeated reads of the same key without a second backend hit while the session is alive.
+	const mediaCache = new Map<string, Blob | null>();
+
+	const cacheMedia = (key: string, blob: Blob | null): void => {
+		mediaCache.set(key, blob);
+	};
+
+	const loadMedia = async (key: string): Promise<Blob | null> => {
+		if (mediaCache.has(key)) return mediaCache.get(key) ?? null;
+		if (!backend) return null;
+		const blob = await backend.loadMedia(key);
+		mediaCache.set(key, blob);
+		return blob;
+	};
+
+	const evictItemMedia = (id: string, fileCount: number): void => {
+		mediaCache.delete(videoKey(id));
+		mediaCache.delete(thumbnailKey(id));
+		for (let i = 0; i < fileCount; i++) mediaCache.delete(fileKey(id, i));
+	};
+
 	let loadPromise: Promise<void> | null = null;
 
-	async function persistItem(item: HistoryItem, videoBlob: Blob): Promise<void> {
+	async function persistItem(item: HistoryItem, videoBlob: Blob, thumbnailBlob: Blob, fileBlobs: Blob[]): Promise<void> {
 		if (!backend) return;
 		try {
 			await backend.save(item, videoBlob);
@@ -94,14 +132,27 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		} catch {
 			// Best-effort: a failed write leaves the item session-only rather than missing from the running list.
 			item.persisted = false;
+			return;
+		}
+		try {
+			await backend.storeMedia(thumbnailKey(item.id), thumbnailBlob);
+			for (let i = 0; i < fileBlobs.length; i++) {
+				const blob = fileBlobs[i];
+				if (blob) await backend.storeMedia(fileKey(item.id, i), blob);
+			}
+		} catch {
+			// A failed media write is also best-effort; the record still persists and media degrades to a placeholder.
 		}
 	}
 
-	// Bound in-memory growth only; drop the oldest items from the resident list so an extended session cannot grow memory without bound.
+	// Bounds in-memory cardinality, not byte size directly: it caps the item COUNT (MAX_IN_MEMORY) so an extended session cannot grow memory without bound.
 	// Eviction never touches the backend: the persisted archive stays intact so a refresh (via load()) restores everything.
+	// Evicting an item also releases its cached media Blobs (full-size inputs + videos), and dropping the oldest items is what keeps the resident byte cache bounded.
 	function trimMemory(): void {
 		const excess = items.length - MAX_IN_MEMORY;
 		if (excess <= 0) return;
+		const evicted = items.slice(0, excess);
+		for (const item of evicted) evictItemMedia(item.id, item.files.length);
 		items.splice(0, excess);
 	}
 
@@ -129,22 +180,36 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 			}
 			return loadPromise;
 		},
-		add(item: HistoryItem, videoBlob: Blob): void {
+		add(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void {
 			items.push(item);
 			item.persisted = false;
-			void persistItem(item, videoBlob);
+			cacheMedia(videoKey(item.id), media.video);
+			cacheMedia(thumbnailKey(item.id), media.thumbnail);
+			for (let i = 0; i < media.files.length; i++) {
+				const blob = media.files[i];
+				if (blob) cacheMedia(fileKey(item.id, i), blob);
+			}
+			void persistItem(item, media.video, media.thumbnail, media.files);
 			trimMemory();
 		},
-		loadVideoBlob(id: string): Promise<Blob | null> {
-			if (!backend) return Promise.resolve(null);
-			return backend.loadVideoBlob(id);
+		loadVideo(id: string): Promise<Blob | null> {
+			return loadMedia(videoKey(id));
+		},
+		loadThumbnail(id: string): Promise<Blob | null> {
+			return loadMedia(thumbnailKey(id));
+		},
+		loadFile(id: string, index: number): Promise<Blob | null> {
+			return loadMedia(fileKey(id, index));
+		},
+		loadFileByKey(key: string): Promise<Blob | null> {
+			return loadMedia(key);
 		},
 		markViewed(id: string): void {
 			const item = items.find((i) => i.id === id);
 			if (!item || item.viewed) return;
 			item.viewed = true;
 			if (backend) {
-				backend.update(item).catch(() => {
+				backend.setViewed(id, true).catch(() => {
 					// Best-effort: only the persisted flag may be stale; the running list is already updated.
 				});
 			}
@@ -152,7 +217,10 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		remove(id: string): void {
 			const idx = items.findIndex((i) => i.id === id);
 			if (idx < 0) return;
+			const removed = items[idx];
+			const fileCount = removed ? removed.files.length : 0;
 			items.splice(idx, 1);
+			evictItemMedia(id, fileCount);
 			if (backend) {
 				backend.remove(id).catch(() => {
 					// ignore
@@ -167,6 +235,7 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		},
 		clear(): void {
 			items.length = 0;
+			mediaCache.clear();
 			if (backend) {
 				backend.clear().catch(() => {
 					// ignore

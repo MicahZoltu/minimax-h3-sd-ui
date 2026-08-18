@@ -10,18 +10,45 @@ import { h, clear, type Child } from "./dom.js";
 import { downloadBlob, downloadDataUrl } from "./download.js";
 import { setupFavicon } from "./favicon.js";
 import { estimateStorage } from "./history.js";
+import { thumbnailKey } from "./media.js";
 import { pump } from "./queue.js";
 import { GENERATION_PRESET } from "./request.js";
 import type { Store } from "./state.js";
 import { FALLBACK_DIMS } from "./state.js";
 import type { JobProgress } from "./api.js";
 import type { HistoryItem, QueueItem } from "./types.js";
-import { dataUrlToBytes, formatElapsed, sanitizeBasename, uid } from "./utils.js";
+import { formatElapsed, sanitizeBasename, uid } from "./utils.js";
 import { analyzeZip, buildSourceZip } from "./zip.js";
 
 const isHTMLElement = (el: unknown): el is HTMLElement => el instanceof HTMLElement;
 const isInputElement = (el: unknown): el is HTMLInputElement => el instanceof HTMLInputElement;
 const isVideoElement = (el: unknown): el is HTMLVideoElement => el instanceof HTMLVideoElement;
+
+// One blob: URL per media key so a cached Blob maps to a stable URL; a key that already has a URL reuses it.
+// URLs are revoked only once the owning row leaves the DOM (see renderHistorySection), never while a live
+// <img>/<video> (e.g. an open <details> thumb or the lightbox) still references them.
+const mediaUrls = new Map<string, string>();
+
+function objectUrlFor(key: string, blob: Blob): string {
+	const existing = mediaUrls.get(key);
+	if (existing) return existing;
+	const url = URL.createObjectURL(blob);
+	mediaUrls.set(key, url);
+	return url;
+}
+
+function revokeIdMedia(id: string): void {
+	for (const key of [...mediaUrls.keys()]) {
+		if (key === id || key.startsWith(`${id}:`)) {
+			const url = mediaUrls.get(key);
+			if (url) URL.revokeObjectURL(url);
+			mediaUrls.delete(key);
+		}
+	}
+}
+
+// History details that are loading (or loaded) their file thumbs, so a quick close/re-open does not double-load.
+const populating = new Set<string>();
 
 function frameDurationLabel(frames: number): string {
 	const seconds = frames / GENERATION_PRESET.fps;
@@ -56,7 +83,9 @@ export function mount(store: Store, root: HTMLElement): void {
 	let lastHistorySig = "";
 	let lastFormRev = -1;
 	let lastQueueRev = -1;
-	let lastResidentId = store.residentId();
+	// Start unset so the first resident render forces a swap to the recorded resident, even when the
+	// history load's setResident emit already fired before this UI subscribed.
+	let lastResidentId: string | null = null;
 
 	let storageModalOpen = false;
 	let lastEstimate: { usage: number; quota: number } | null = null;
@@ -208,6 +237,49 @@ export function mount(store: Store, root: HTMLElement): void {
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
 	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
 
+	// List videos pause once they scroll out of view so many completed items do not all decode simultaneously.
+	// Visible rows keep their native autoplay.
+	//
+	// These three must be initialized before any render section can run:
+	// renderQueueSection, renderHistorySection, and swapResidentMedia each call observeListMedia, and the
+	// initial render block below executes them as soon as mount() drives the domains, so a later declaration
+	// would read the const inside its temporal dead zone and throw a ReferenceError on first render.
+	const listObserver = new IntersectionObserver(
+		(entries) => {
+			for (const entry of entries) {
+				const video = maybeElement(entry.target, isVideoElement);
+				if (!video) continue;
+				if (entry.isIntersecting) {
+					video.play().catch(() => {});
+				} else {
+					video.pause();
+				}
+			}
+		},
+		{ rootMargin: "120px" },
+	);
+	const observeListMedia = (scope: HTMLElement) => {
+		listObserver.disconnect();
+		scope.querySelectorAll("video.row-media").forEach((v) => listObserver.observe(v));
+	};
+	// Swap the resident <video> between rows in place, so an expanded prompt <details> on any other row survives the change.
+	// Only the previous row's media becomes a thumbnail and the new row's media becomes the autoplay video; nothing else is re-rendered.
+	const swapResidentMedia = (previousId: string | null, nextId: string | null): void => {
+		const swapRow = (id: string | null, asResident: boolean): void => {
+			if (id === null) return;
+			const item = store.history.items().find((i) => i.id === id);
+			if (!item) return;
+			const media = historyRowsEl.querySelector(`.row-media[data-id="${CSS.escape(id)}"]`);
+			const row = maybeElement(media ? media.closest("li.job-row.history") : null, isHTMLElement);
+			if (!row || !media) return;
+			const replacement = buildRowMedia(store, item, asResident, asResident ? store.residentUrl() : null);
+			row.replaceChild(replacement, media);
+		};
+		swapRow(previousId, false);
+		swapRow(nextId, true);
+		observeListMedia(historyRowsEl);
+	};
+
 	// Lightbox: click the media preview or an input thumbnail anywhere in the list to view it enlarged, shrunk to fit the viewport.
 	// Clicking the backdrop closes it.
 	// The compressed plan/reason are filled in asynchronously by a probe once a video opens; until then the button stays disabled.
@@ -218,6 +290,7 @@ export function mount(store: Store, root: HTMLElement): void {
 		stem: string;
 		plan: CompressionPlan | null;
 		reason: UnsupportedReason | null;
+		imageBlob?: Blob;
 	}
 	let lightbox: LightboxState | null = null;
 	const renderLightbox = (): void => {
@@ -379,12 +452,6 @@ export function mount(store: Store, root: HTMLElement): void {
 			unlockAfterCompression();
 		}
 	};
-	const lookupImage = (id: string, name: string): string | null => {
-		const inQueue = store.state.queue.find((i) => i.id === id)?.files.find((f) => f.name === name);
-		if (inQueue) return inQueue.dataUrl;
-		const inHistory = store.history.items().find((i) => i.id === id)?.files.find((f) => f.name === name);
-		return inHistory ? inHistory.dataUrl : null;
-	};
 	// Capture-phase guard: interacting with a row's prompt block or actions (e.g. expanding the collapsed <details>) must not bubble into the history-row click.
 	// Elements that carry their own [data-action] (thumbnails, download buttons) still bubble normally.
 	app.addEventListener(
@@ -423,9 +490,26 @@ export function mount(store: Store, root: HTMLElement): void {
 		if (action === "view-image") {
 			event.stopPropagation();
 			const name = actionEl.getAttribute("data-name") ?? "";
-			const src = lookupImage(actionEl.getAttribute("data-id") ?? "", name) ?? actionEl.getAttribute("src") ?? "";
-			if (src) lightbox = { kind: "image", src, filename: name || "image", stem: "", plan: null, reason: null };
-			renderLightbox();
+			const id = actionEl.getAttribute("data-id") ?? "";
+			const fallback = actionEl.getAttribute("src") ?? "";
+			const show = (src: string, imageBlob?: Blob): void => {
+				if (!src) return;
+				const state: LightboxState = { kind: "image", src, filename: name || "image", stem: "", plan: null, reason: null };
+				if (imageBlob) state.imageBlob = imageBlob;
+				lightbox = state;
+				renderLightbox();
+			};
+			const item = store.history.items().find((i) => i.id === id);
+			const index = item ? item.files.findIndex((f) => f.name === name) : -1;
+			if (item && index >= 0) {
+				const file = item.files[index];
+				void store.history.loadFile(id, index).then((blob) => {
+					if (blob && file) show(objectUrlFor(file.key, blob), blob);
+					else show(fallback);
+				}).catch(() => show(fallback));
+			} else {
+				show(fallback);
+			}
 		} else if (action === "view-video") {
 			event.stopPropagation();
 			const id = actionEl.getAttribute("data-id") ?? "";
@@ -455,6 +539,8 @@ export function mount(store: Store, root: HTMLElement): void {
 			if (lightbox.kind === "video") {
 				const blob = store.residentBlob();
 				if (blob) downloadBlob(blob, lightbox.filename);
+			} else if (lightbox.imageBlob) {
+				downloadBlob(lightbox.imageBlob, lightbox.filename);
 			} else {
 				downloadDataUrl(lightbox.src, lightbox.filename);
 			}
@@ -508,9 +594,34 @@ export function mount(store: Store, root: HTMLElement): void {
 		return store.history.items().map((i) => `${i.id}:${i.createdAt}:${i.viewed ? "1" : "0"}`).join(",");
 	}
 
+	// Reconcile the queue list in place by data-id rather than clearing and rebuilding every row.
+	// Unchanged rows keep their existing node (so an open <details> and the live [data-progress] bar survive),
+	// while changed or new rows are swapped for freshly built ones. The queue is small, so this stays synchronous.
 	function renderQueueSection(): void {
-		clear(queueRowsEl);
-		for (const row of buildQueueRows(store)) queueRowsEl.appendChild(row);
+		const rows = buildQueueRows(store);
+		const existing = new Map<string, HTMLElement>();
+		for (const row of queueRowsEl.querySelectorAll<HTMLElement>("li.job-row.queue")) {
+			existing.set(row.getAttribute("data-id") ?? "", row);
+		}
+		const wanted = new Set(rows.map((r) => r.getAttribute("data-id") ?? ""));
+		for (const [id, row] of existing) {
+			if (!wanted.has(id)) row.remove();
+		}
+		let prev: HTMLElement | null = null;
+		for (const row of rows) {
+			const id = row.getAttribute("data-id") ?? "";
+			const current = existing.get(id);
+			if (current && current.getAttribute("data-sig") === row.getAttribute("data-sig")) {
+				if (prev && current !== prev.nextSibling) queueRowsEl.insertBefore(current, prev.nextSibling);
+				else if (!prev && current !== queueRowsEl.firstChild) queueRowsEl.insertBefore(current, queueRowsEl.firstChild);
+				prev = current;
+			} else {
+				if (current) current.remove();
+				queueRowsEl.insertBefore(row, prev ? prev.nextSibling : queueRowsEl.firstChild);
+				prev = row;
+			}
+		}
+		observeListMedia(queueRowsEl);
 		updateListEmpty();
 	}
 
@@ -525,14 +636,18 @@ export function mount(store: Store, root: HTMLElement): void {
 		}
 		const wanted = new Set(items.map((i) => i.id));
 		for (const [id, row] of existing) {
-			if (!wanted.has(id)) row.remove();
+			if (!wanted.has(id)) {
+				row.remove();
+				// Revoke this item's URLs only after its row left the DOM so no live media still references them.
+				revokeIdMedia(id);
+			}
 		}
 		// Reconcile in display (newest-first) order: insert missing rows in place, move rows that shifted, and toggle the "new" highlight in place.
 		let prev: HTMLElement | null = null;
 		for (const item of items) {
 			let row = existing.get(item.id);
 			if (!row) {
-				row = buildHistoryRow(item);
+				row = buildHistoryRow(store, item);
 				historyRowsEl.insertBefore(row, prev ? prev.nextSibling : historyRowsEl.firstChild);
 			} else {
 				row.classList.toggle("new", !item.viewed);
@@ -548,69 +663,49 @@ export function mount(store: Store, root: HTMLElement): void {
 		updateListEmpty();
 	}
 
-	function render(): void {
-		updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
+	// Subscribe per domain so a queue/progress/resident emission never scans the history list (and vice versa).
+	// The history renderer still gates on historySig(), but only runs when the `history` domain actually fired.
+	const renderHeader = (): void => updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
+	const renderFormDomain = (): void => {
 		if (store.revs.form !== lastFormRev) {
 			lastFormRev = store.revs.form;
 			renderForm();
 		}
+	};
+	const renderQueueDomain = (): void => {
 		if (store.revs.queue !== lastQueueRev) {
 			lastQueueRev = store.revs.queue;
 			renderQueueSection();
 		}
+	};
+	const renderHistoryDomain = (): void => {
 		const sig = historySig();
 		if (sig !== lastHistorySig) {
 			lastHistorySig = sig;
 			renderHistorySection();
 		}
-		// The resident change is always applied in place on the single affected row, whether or not the signature changed.
+	};
+	// The resident change is always applied in place on the single affected row, whether or not the signature changed.
+	const renderResidentDomain = (): void => {
 		const nextResidentId = store.residentId();
 		if (nextResidentId !== lastResidentId) swapResidentMedia(lastResidentId, nextResidentId);
 		lastResidentId = nextResidentId;
-		renderStorageModal();
-	}
-
-	// Pause list videos once they scroll out of view so many completed items do not all decode simultaneously.
-	// Visible ones keep their native autoplay.
-	// Declared before the first render() call below so renderHistorySection can observe media without hitting a temporal-dead-zone error.
-	const listObserver = new IntersectionObserver(
-		(entries) => {
-			for (const entry of entries) {
-				const video = maybeElement(entry.target, isVideoElement);
-				if (!video) continue;
-				if (entry.isIntersecting) {
-					video.play().catch(() => {});
-				} else {
-					video.pause();
-				}
-			}
-		},
-		{ rootMargin: "120px" },
-	);
-	const observeListMedia = (scope: HTMLElement) => {
-		listObserver.disconnect();
-		scope.querySelectorAll("video.row-media").forEach((v) => listObserver.observe(v));
 	};
-	// Swap the resident <video> between rows in place, so an expanded prompt <details> on any other row survives the change.
-	// Only the previous row's media becomes a thumbnail and the new row's media becomes the autoplay video; nothing else is re-rendered.
-	const swapResidentMedia = (previousId: string | null, nextId: string | null): void => {
-		const swapRow = (id: string | null, asResident: boolean): void => {
-			if (id === null) return;
-			const item = store.history.items().find((i) => i.id === id);
-			if (!item) return;
-			const media = historyRowsEl.querySelector(`.row-media[data-id="${CSS.escape(id)}"]`);
-			const row = maybeElement(media ? media.closest("li.job-row.history") : null, isHTMLElement);
-			if (!row || !media) return;
-			const replacement = buildRowMedia(item, asResident, asResident ? store.residentUrl() : null);
-			row.replaceChild(replacement, media);
-		};
-		swapRow(previousId, false);
-		swapRow(nextId, true);
-		observeListMedia(historyRowsEl);
-	};
+	const renderStorageDomain = (): void => renderStorageModal();
 
-	store.subscribe(render);
-	render();
+	store.subscribe(renderHeader, ["caps"]);
+	store.subscribe(renderFormDomain, ["form"]);
+	store.subscribe(renderQueueDomain, ["queue"]);
+	store.subscribe(renderHistoryDomain, ["history"]);
+	store.subscribe(renderResidentDomain, ["resident"]);
+	store.subscribe(renderStorageDomain, ["history", "queue", "caps"]);
+
+	renderHeader();
+	renderFormDomain();
+	renderQueueDomain();
+	renderHistoryDomain();
+	renderResidentDomain();
+	renderStorageDomain();
 
 	// Update live elapsed timers and progress bars in place (does not rebuild video elements).
 	setInterval(() => updateLive(store), 1000);
@@ -783,6 +878,12 @@ function buildQueueRows(store: Store): HTMLElement[] {
 	return rows;
 }
 
+// A stable fingerprint of a queue row's dynamic content, so renderQueueSection can reuse an existing node
+// (preserving its open <details> and live [data-progress]) unless its content actually changed.
+function queueRowSignature(item: QueueItem, queuedIndex: number, queuedCount: number, progressOk: boolean): string {
+	return JSON.stringify([item.status, item.error ?? null, item.startedAt ?? null, queuedIndex === 0, queuedIndex === queuedCount - 1, progressOk]);
+}
+
 function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progressOk = false): HTMLElement {
 	const isQueued = item.status === "queued";
 	const isActive = item.status === "submitting" || item.status === "generating";
@@ -832,20 +933,31 @@ function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progr
 	];
 	if (actions.length > 0) body.push(h("div", { class: "row-actions" }, actions));
 
-	return h("li", { class: `job-row queue ${item.status}` }, body);
+	return h("li", { class: `job-row queue ${item.status}`, "data-id": item.id, "data-sig": queueRowSignature(item, queuedIndex, queuedCount, progressOk) }, body);
 }
 
-function buildRowMedia(item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
+// The non-resident row media is an <img> built without a src; its Blob is loaded on demand and attached in
+// place only once it resolves and the node is still connected. Building the list therefore loads no bytes.
+function attachRowThumb(store: Store, img: HTMLImageElement, id: string): void {
+	void store.history.loadThumbnail(id).then((blob) => {
+		if (!blob || !img.isConnected) return;
+		img.src = objectUrlFor(thumbnailKey(id), blob);
+	}).catch(() => {});
+}
+
+function buildRowMedia(store: Store, item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
 	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
 		return h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
 	}
-	return h("img", { class: "row-media", src: item.thumbnail, alt: item.prompt, decoding: "async", loading: "lazy", "data-action": "view-video", "data-id": item.id });
+	const img = h("img", { class: "row-media", alt: item.prompt, decoding: "async", loading: "lazy", "data-action": "view-video", "data-id": item.id });
+	if (img instanceof HTMLImageElement) attachRowThumb(store, img, item.id);
+	return img;
 }
 
 // History rows always render their thumbnail (never the resident video); the resident <video> is attached in place by swapResidentMedia.
 // The resident id is attached to the <li> so renderHistorySection can reconcile rows by id without rebuilding them.
-function buildHistoryRow(item: HistoryItem): HTMLElement {
-	const media = buildRowMedia(item, false, null);
+function buildHistoryRow(store: Store, item: HistoryItem): HTMLElement {
+	const media = buildRowMedia(store, item, false, null);
 
 	return h("li", { class: item.viewed ? "job-row history" : "job-row history new", "data-id": item.id }, [
 		media,
@@ -896,9 +1008,7 @@ function mediaDownloadName(item: HistoryItem): string {
 const PIE_COLORS = ["#5b8cff", "#e6b45c", "#4cc38a", "#e0605f", "#c678dd", "#7aa3b0"];
 
 function historyItemBytes(item: HistoryItem): number {
-	const video = item.video.byteSize;
-	const files = item.files.reduce((n, f) => n + f.dataUrl.length, 0);
-	return Math.round((files * 3) / 4) + video;
+	return item.video.byteSize + item.thumbBytes + item.files.reduce((n, f) => n + f.bytes, 0);
 }
 
 function drawStoragePie(canvas: HTMLCanvasElement, slices: { value: number; color: string }[], usage: number, quota: number): void {
@@ -1017,7 +1127,9 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 		}
 	});
 	// Deferred <details> thumbs: fill the empty .thumbs container the first time a prompt block is opened.
-	// <details> rows are inserted/reordered by the keyed reconcile, but `toggle` bubbles, so delegation reaches them.
+	// Listen in the capture phase because some browsers and webviews do not bubble `toggle` from <details>;
+	// a bubble-phase delegated listener would never fire there, leaving the .thumbs container empty.
+	// In capture phase event.target is still the actual <details> row, and the guards below stay idempotent for browsers that do bubble.
 	root.addEventListener("toggle", (event) => {
 		const el = event.target instanceof HTMLElement ? event.target.closest("details[data-lazy-files]") : null;
 		if (!(el instanceof HTMLDetailsElement) || !el.open) return;
@@ -1025,18 +1137,42 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 		if (!container || container.childElementCount > 0) return;
 		const id = el.getAttribute("data-lazy-files");
 		const kind = el.getAttribute("data-files-kind");
-		if (!id) return;
-		const files =
-			kind === "history"
-				? store.history.items().find((i) => i.id === id)?.files
-				: kind === "queue"
-					? store.state.queue.find((i) => i.id === id)?.files
-					: undefined;
+		if (!id || populating.has(id)) return;
+		if (kind === "history") {
+			// History file bytes live as Blobs; load each on demand and attach only once it resolves and the details are still open.
+			const item = store.history.items().find((i) => i.id === id);
+			if (!item || item.files.length === 0) return;
+			populating.add(id);
+			let remaining = item.files.length;
+			// Load each blob by the file's RECORDED media-store key, never by a renumbered array index.
+			// A record's file keys are authoritative and can be non-contiguous with the array (e.g. legacy items
+			// migrated from inline base64 that skipped a non-object entry); an array index would read the wrong key and drop the image.
+			item.files.forEach((file) => {
+				void store.history.loadFileByKey(file.key).then((blob) => {
+					// Do not hold the .thumbs node captured at toggle time and write into it on resolve: the keyed
+					// reconcile (renderHistorySection) can rebuild the row while an async IndexedDB load is in flight,
+					// detaching that old container so a resolved blob would be dropped by the isConnected guard and the
+					// images would never appear. Re-resolve the current row by data-id and its live .thumbs at resolve
+					// time instead, so a freshly rendered row still receives the thumbs.
+					const liveRow = maybeElement(root.querySelector(`details[data-lazy-files="${CSS.escape(id)}"]`), isHTMLElement);
+					const liveContainer = liveRow ? maybeElement(liveRow.querySelector(".thumbs"), isHTMLElement) : null;
+					if (!blob || !liveContainer || !liveContainer.isConnected) return;
+					const img = h("img", { class: "thumb", alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" });
+					if (img instanceof HTMLImageElement) img.src = objectUrlFor(file.key, blob);
+					liveContainer.appendChild(img);
+				}).finally(() => {
+					remaining -= 1;
+					if (remaining <= 0) populating.delete(id);
+				}).catch(() => {});
+			});
+			return;
+		}
+		const files = kind === "queue" ? store.state.queue.find((i) => i.id === id)?.files : undefined;
 		if (!files || files.length === 0) return;
 		for (const file of files) {
 			container.appendChild(h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" }));
 		}
-	});
+	}, true);
 
 	// Drop zone: open the picker on click (freshly query the re-rendered input).
 	root.addEventListener("click", (event) => {
@@ -1222,17 +1358,15 @@ function truncate(value: string, max: number): string {
 async function downloadSourceZip(store: Store, id: string): Promise<void> {
 	const item = store.history.items().find((i) => i.id === id);
 	if (!item) return;
-	const source = item.files.map((file) => ({
-		name: file.name,
-		bytes: dataUrlToBytes(file.dataUrl),
-	}));
+	// Load each persisted input file's Blob on demand and rebuild the source zip from its bytes.
+	const source: { name: string; bytes: Uint8Array }[] = [];
+	for (let i = 0; i < item.files.length; i++) {
+		const file = item.files[i];
+		if (!file) continue;
+		const blob = await store.history.loadFile(id, i);
+		if (!blob) continue;
+		source.push({ name: file.name, bytes: new Uint8Array(await blob.arrayBuffer()) });
+	}
 	const blob = buildSourceZip(source, item.prompt);
-	const url = URL.createObjectURL(blob);
-	const a = document.createElement("a");
-	a.href = url;
-	a.download = item.zipName ?? `${id}.zip`;
-	document.body.appendChild(a);
-	a.click();
-	a.remove();
-	setTimeout(() => URL.revokeObjectURL(url), 5000);
+	downloadBlob(blob, item.zipName ?? `${id}.zip`);
 }

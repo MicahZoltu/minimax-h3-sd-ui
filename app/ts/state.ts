@@ -120,6 +120,19 @@ export interface Revisions {
 	queue: number;
 }
 
+/**
+ * Coarse change domains used to route notifications only to the subscribers that care.
+ * Splitting `emit()` by domain keeps per-poll progress or resident changes from scanning the whole list.
+ */
+export type ChangeDomain = "form" | "queue" | "history" | "resident" | "caps";
+
+const ALL_DOMAINS: readonly ChangeDomain[] = ["form", "queue", "history", "resident", "caps"];
+
+interface Subscription {
+	fn: () => void;
+	domains: ReadonlySet<ChangeDomain>;
+}
+
 export interface Store {
 	state: AppState;
 	/** Monotonic revision counters used by the UI to re-render only what changed. */
@@ -127,25 +140,27 @@ export interface Store {
 	history: ReturnType<typeof createHistoryStore>;
 	/** Resolves once the initial queue load from the persisted backend has completed. */
 	queueReady: Promise<void>;
-	subscribe(fn: () => void): () => void;
-	emit(): void;
+	/** Register a change listener (optionally filtered to one or more domains). Returns an unsubscriber. */
+	subscribe(fn: () => void, domains?: readonly ChangeDomain[]): () => void;
+	emit(domains: ChangeDomain | readonly ChangeDomain[]): void;
 	pushQueue(item: QueueItem): void;
 	patchQueueItem(id: string, patch: Partial<QueueItem>): void;
 	/**
 	 * Record the latest generation progress for a running item.
 	 * Unlike patchQueueItem it is in-memory only: it neither bumps the queue revision (so frequent
-	 * polls do not rebuild the list) nor persists, because progress is transient and changes every poll.
+	 * polls do not rebuild the list), nor persists, nor emits (progress is transient and updated in place
+	 * by the UI's own ticker), because progress changes every poll.
 	 */
 	setQueueProgress(id: string, progress: JobProgress): void;
 	removeQueue(id: string): void;
 	moveQueue(from: number, to: number): void;
-	addHistory(item: HistoryItem, videoBlob: Blob): void;
+	addHistory(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void;
 	/** Mark a completed history item as viewed (clears its "new" highlight and favicon contribution). */
 	markHistoryViewed(id: string): void;
 	removeHistory(id: string): void;
 	removeOldestHistory(count: number): void;
 	clearHistory(): void;
-	setResident(id: string): Promise<void>;
+	setResident(id: string, preloaded?: Blob): Promise<void>;
 	residentId(): string | null;
 	residentUrl(): string | null;
 	residentBlob(): Blob | null;
@@ -166,7 +181,7 @@ export interface Store {
 }
 
 export function createStore(queueBackend: QueueBackend = createIdbQueue()): Store {
-	const listeners = new Set<() => void>();
+	const subscriptions: Subscription[] = [];
 	const state: AppState = {
 		caps: null,
 		online: false,
@@ -209,14 +224,18 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		hadSavedDims = true;
 	}
 	let resident: { id: string; blob: Blob; url: string } | null = null;
+	// Monotonic token so a setResident call that had to await loadVideo cannot overwrite a newer call's result.
+	let residentRequestToken = 0;
 
 	// Revision counters: the UI re-renders a region only when its counter changes, which keeps background polling from rebuilding the form and stealing focus while the user is typing.
 	const revs: Revisions = { form: 0, queue: 0 };
 
-	const emit = () => {
-		for (const fn of [...listeners]) {
+	const emit = (domains: ChangeDomain | readonly ChangeDomain[]): void => {
+		const fired = typeof domains === "string" ? [domains] : domains;
+		for (const sub of [...subscriptions]) {
+			if (!fired.some((d) => sub.domains.has(d))) continue;
 			try {
-				fn();
+				sub.fn();
 			} catch {
 				// A subscriber must never break the rest of the app.
 			}
@@ -240,7 +259,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.vidProgress = supportsVideoProgress(caps);
 			state.progressError = state.vidProgress ? null : VIDEO_PROGRESS_ERROR;
 			state.apiBase = getApiBase();
-			emit();
+			emit("caps");
 			const v = caps.defaults_by_mode?.vid_gen;
 			const f = state.form;
 			if (!f.analysis && !hadSavedDims) {
@@ -252,7 +271,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.online = false;
 			state.capsError = err instanceof Error ? err.message : String(err);
 			state.progressError = null;
-			emit();
+			emit("caps");
 		}
 	};
 
@@ -262,15 +281,19 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		revs,
 		history,
 		queueReady,
-		subscribe: (fn) => {
-			listeners.add(fn);
-			return () => listeners.delete(fn);
+		subscribe: (fn, domains) => {
+			const sub: Subscription = { fn, domains: new Set(domains && domains.length > 0 ? domains : ALL_DOMAINS) };
+			subscriptions.push(sub);
+			return () => {
+				const i = subscriptions.indexOf(sub);
+				if (i >= 0) subscriptions.splice(i, 1);
+			};
 		},
 		emit,
 		setForm: (patch) => {
 			Object.assign(state.form, patch);
 			revs.form += 1;
-			emit();
+			emit("form");
 		},
 		setFormDim: (field, value) => {
 			state.form[field] = value;
@@ -286,7 +309,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.queue.unshift(item);
 			revs.queue += 1;
 			queueWrites += 1;
-			emit();
+			emit("queue");
 			// Mutate in-memory synchronously (the UI source of truth), persist best-effort in the background.
 			void queueBackend.save(state.queue);
 		},
@@ -305,7 +328,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 				Object.assign(item, patch);
 				revs.queue += 1;
 				queueWrites += 1;
-				emit();
+				emit("queue");
 				void queueBackend.save(state.queue);
 			}
 		},
@@ -315,7 +338,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			// Skip work when the value is unchanged so emit() fires only on an actual update.
 			if (item.progress && item.progress.step === progress.step && item.progress.steps === progress.steps) return;
 			item.progress = progress;
-			emit();
 		},
 		removeQueue: (id) => {
 			const idx = findIndex(id);
@@ -323,7 +345,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.queue.splice(idx, 1);
 			revs.queue += 1;
 			queueWrites += 1;
-			emit();
+			emit("queue");
 			void queueBackend.save(state.queue);
 		},
 		moveQueue: (from, to) => {
@@ -335,40 +357,41 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			revs.queue += 1;
 			queueWrites += 1;
 			void queueBackend.save(state.queue);
-			emit();
+			emit("queue");
 		},
-		addHistory: (item, videoBlob) => {
-			history.add(item, videoBlob);
-			emit();
+		addHistory: (item, media) => {
+			history.add(item, media);
+			emit("history");
 		},
 		markHistoryViewed: (id) => {
 			history.markViewed(id);
-			emit();
+			emit("history");
 		},
 		removeHistory: (id) => {
 			history.remove(id);
 			if (resident?.id === id) clearResident();
-			emit();
+			emit("history");
 		},
 		removeOldestHistory: (count) => {
 			history.removeOldest(count);
 			const rid = resident?.id ?? null;
 			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
-			emit();
+			emit("history");
 		},
 		clearHistory: () => {
 			history.clear();
 			const rid = resident?.id ?? null;
 			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
-			emit();
+			emit("history");
 		},
-		setResident: async (id) => {
+		setResident: async (id, preloaded) => {
 			if (resident?.id === id) return;
-			const blob = await history.loadVideoBlob(id);
-			if (!blob) return;
+			const token = ++residentRequestToken;
+			const blob = preloaded ?? (await history.loadVideo(id));
+			if (!blob || token !== residentRequestToken) return;
 			if (resident) URL.revokeObjectURL(resident.url);
 			resident = { id, blob, url: URL.createObjectURL(blob) };
-			emit();
+			emit("resident");
 		},
 		residentId: () => (resident ? resident.id : null),
 		residentUrl: () => (resident ? resident.url : null),
@@ -376,21 +399,21 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		setApiBase: (value) => {
 			const normalized = writeApiBase(value);
 			state.apiBase = getApiBase();
-			emit();
+			emit("caps");
 			void fetchCapabilities();
 			return normalized;
 		},
 		resetApiBase: () => {
 			clearApiBase();
 			state.apiBase = getApiBase();
-			emit();
+			emit("caps");
 			void fetchCapabilities();
 		},
 		fetchCapabilities,
 	};
 
 	void history.load().then(() => {
-		emit();
+		emit("history");
 		const newest = history.items().at(-1);
 		if (newest) void store.setResident(newest.id);
 	});
@@ -398,13 +421,14 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 	// Hydrate the queue from the persisted backend. The load is best-effort (never throws): when the
 	// backend is unavailable it resolves to an empty queue and the session is queue-only-like-memory.
 	void (async () => {
-		const loaded = await queueBackend.load();
+		const loaded = await queueBackend.load().catch(() => null);
 		// Only surface the persisted snapshot if nothing was mutated while it was loading, so an early
 		// user action is never clobbered by a stale read (load is typically faster than user input).
-		if (queueWrites === queueWritesAtStart) {
+		// A throwing backend resolves nothing: the session stays in-memory only, exactly like an unavailable backend.
+		if (loaded !== null && queueWrites === queueWritesAtStart) {
 			state.queue = loaded;
 			revs.queue += 1;
-			emit();
+			emit("queue");
 		}
 		resolveQueueReady();
 	})();

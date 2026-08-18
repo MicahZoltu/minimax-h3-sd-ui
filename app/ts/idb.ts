@@ -6,10 +6,14 @@
 // This module never rejects; callers treat it as best-effort.
 
 import { isHistoryItem, isQueueItem, type HistoryBackend, type QueueBackend } from "./history.js";
+import { thumbnailKey, videoKey } from "./media.js";
 import type { HistoryItem, QueueItem } from "./types.js";
 
 const DB_NAME = "sdcpp.video";
-const DB_VERSION = 3;
+// The version must never drop below the highest version users' databases were ever opened at.
+// IndexedDB refuses to open an existing database at a lower version (VersionError), which would hide all history.
+// Users' databases are already at version 4, so it stays 4 forever; the `oldVersion < 3` branch still creates the stores for brand-new databases.
+const DB_VERSION = 4;
 const HISTORY_STORE = "history";
 const MEDIA_STORE = "media";
 // The whole generation queue (queued + in-flight items, including each item's files[].dataUrl images) lives under one fixed key.
@@ -21,14 +25,16 @@ function database(): Promise<IDBDatabase | null> {
 	if (typeof globalThis.indexedDB === "undefined") return Promise.resolve(null);
 	const request = globalThis.indexedDB.open(DB_NAME, DB_VERSION);
 	return new Promise((resolve) => {
-		request.onupgradeneeded = () => {
+		request.onupgradeneeded = (event) => {
 			const db = request.result;
-			if (!db.objectStoreNames.contains(HISTORY_STORE)) {
-				db.createObjectStore(HISTORY_STORE, { keyPath: "id" });
-			}
-			if (!db.objectStoreNames.contains(MEDIA_STORE)) {
-				// No keyPath: media values are raw binary Blobs, keyed explicitly via put(blob, id).
-				db.createObjectStore(MEDIA_STORE);
+			if (event.oldVersion < 3) {
+				if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+					db.createObjectStore(HISTORY_STORE, { keyPath: "id" });
+				}
+				if (!db.objectStoreNames.contains(MEDIA_STORE)) {
+					// No keyPath: media values are raw binary Blobs, keyed explicitly via put(blob, id).
+					db.createObjectStore(MEDIA_STORE);
+				}
 			}
 			if (!db.objectStoreNames.contains(QUEUE_STORE)) {
 				// No keyPath: the queue is stored as a single array value keyed explicitly via put(items, "queue").
@@ -48,13 +54,21 @@ function onRequest(request: IDBRequest): Promise<unknown> {
 	});
 }
 
-function updateHistoryRecord(item: HistoryItem): Promise<void> {
+function setViewed(id: string, viewed: boolean): Promise<void> {
 	return database().then((db) => {
 		if (!db) return Promise.resolve();
 		return new Promise<void>((resolve) => {
 			try {
 				const tx = db.transaction(HISTORY_STORE, "readwrite");
-				tx.objectStore(HISTORY_STORE).put(item);
+				const store = tx.objectStore(HISTORY_STORE);
+				const readReq = store.get(id);
+				readReq.onsuccess = () => {
+					const record = readReq.result;
+					if (record !== null && typeof record === "object") {
+						const next = { ...(record as Record<string, unknown>), viewed };
+						store.put(next);
+					}
+				};
 				tx.oncomplete = () => resolve();
 				tx.onerror = () => resolve();
 				tx.onabort = () => resolve();
@@ -103,14 +117,25 @@ export function createIdbHistory(): HistoryBackend {
 		async save(item: HistoryItem, videoBlob: Blob): Promise<void> {
 			await runWrite((history, media) => {
 				void history.put(item);
-				void media.put(videoBlob, item.id);
+				void media.put(videoBlob, videoKey(item.id));
 			});
 		},
-		update: updateHistoryRecord,
+		setViewed,
 		async remove(id: string): Promise<void> {
 			await runWrite((history, media) => {
+				// Per-file blobs live under ${id}:file:<index>, which this method does not know by count, so
+				// a bound range cursor deletes every file key for the id in the same transaction as the rest.
+				const range = IDBKeyRange.bound(`${id}:file:`, `${id}:file:\uFFFF`);
+				const cursorReq = media.openCursor(range);
+				cursorReq.onsuccess = () => {
+					const cursor = cursorReq.result;
+					if (!cursor) return;
+					cursor.delete();
+					cursor.continue();
+				};
 				void history.delete(id);
-				void media.delete(id);
+				void media.delete(videoKey(id));
+				void media.delete(thumbnailKey(id));
 			});
 		},
 		async clear(): Promise<void> {
@@ -119,13 +144,28 @@ export function createIdbHistory(): HistoryBackend {
 				void media.clear();
 			});
 		},
-		async loadVideoBlob(id: string): Promise<Blob | null> {
+		async loadMedia(key: string): Promise<Blob | null> {
 			const db = await database();
 			if (!db) return null;
 			const tx = db.transaction(MEDIA_STORE, "readonly");
-			const raw: unknown = await onRequest(tx.objectStore(MEDIA_STORE).get(id));
+			const raw: unknown = await onRequest(tx.objectStore(MEDIA_STORE).get(key));
 			if (raw instanceof Blob) return raw;
 			return null;
+		},
+		async storeMedia(key: string, blob: Blob): Promise<void> {
+			const db = await database();
+			if (!db) return;
+			await new Promise<void>((resolve) => {
+				try {
+					const tx = db.transaction(MEDIA_STORE, "readwrite");
+					tx.objectStore(MEDIA_STORE).put(blob, key);
+					tx.oncomplete = () => resolve();
+					tx.onerror = () => resolve();
+					tx.onabort = () => resolve();
+				} catch {
+					resolve();
+				}
+			});
 		},
 	};
 }

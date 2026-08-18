@@ -17,10 +17,6 @@ export interface FaviconView {
 	unreviewed: boolean;
 }
 
-export function computeFaviconView(active: number, hasUnviewed: boolean): FaviconView {
-	return { active, unreviewed: hasUnviewed };
-}
-
 const SIZE = 64;
 const TYPE = "image/png";
 
@@ -59,7 +55,16 @@ export function setupFavicon(store: Store): void {
 	const hasUnviewed = (): boolean => store.history.items().some((i) => !i.viewed);
 	const inFlight = (): number =>
 		store.state.queue.reduce((n, i) => n + (i.status === "queued" || i.status === "submitting" || i.status === "generating" ? 1 : 0), 0);
-	// Repaint on every store change: completion adds an unviewed item and viewing one removes it.
-	store.subscribe(() => paintFavicon(computeFaviconView(inFlight(), hasUnviewed())));
-	paintFavicon(computeFaviconView(inFlight(), hasUnviewed()));
+	// Coalesce paints to once per animation frame: several store emissions in the same frame draw once.
+	let raf = 0;
+	const schedulePaint = (): void => {
+		if (raf !== 0) return;
+		raf = requestAnimationFrame(() => {
+			raf = 0;
+			paintFavicon({ active: inFlight(), unreviewed: hasUnviewed() });
+		});
+	};
+	// Only the history and queue domains can change the icon (a completion adds an unviewed item, viewing one removes it).
+	store.subscribe(schedulePaint, ["history", "queue"]);
+	schedulePaint();
 }
