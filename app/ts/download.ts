@@ -2,7 +2,7 @@
 // Everything stays in the browser; no data is sent anywhere.
 // Files are materialized as object URLs only for the moment of the download and revoked shortly after.
 
-import { bytesToBlob, dataUrlToBytes } from "./utils.js";
+import { bytesToBlob, dataUrlToBytes, mimeOfDataUrl } from "./utils.js";
 
 function triggerDownload(blob: Blob, filename: string): void {
 	const url = URL.createObjectURL(blob);
@@ -22,9 +22,6 @@ export function downloadBlob(blob: Blob, filename: string): void {
 
 /** Download a raw data URL (e.g. media) under a chosen filename. */
 export function downloadDataUrl(dataUrl: string, filename: string): void {
-	const comma = dataUrl.indexOf(",");
-	const header = comma > 0 ? dataUrl.slice(0, comma) : "";
-	const mime = header.startsWith("data:") ? (header.slice(5).split(";")[0] ?? "application/octet-stream") : "application/octet-stream";
-	const blob = bytesToBlob(dataUrlToBytes(dataUrl), mime);
+	const blob = bytesToBlob(dataUrlToBytes(dataUrl), mimeOfDataUrl(dataUrl));
 	triggerDownload(blob, filename);
 }

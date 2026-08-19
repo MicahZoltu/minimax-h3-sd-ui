@@ -1,5 +1,5 @@
 // Web Worker entry for off-main-thread thumbnail encoding.
-// Receives a transferred ImageData frame, downscales it to ≤320px, and returns a JPEG Blob.
+// Receives an ImageData frame, downscales it to ≤320px, and returns a JPEG Blob.
 // Exports nothing; wiring self.onmessage on load is the whole point.
 
 import { encodeThumbnailBlob, resolveThumbnailRequest } from "./thumbnail.js";

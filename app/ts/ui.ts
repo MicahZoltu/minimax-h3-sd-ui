@@ -2,82 +2,28 @@
 // The UI is small and deliberately simple: render functions rebuild section containers from the store, and a single event delegation handler routes user actions.
 // No markup is ever built from unescaped strings, so uploaded prompts / file names are always safe.
 
-import { getConfigurableBase } from "./config.js";
-import { planLabel } from "./compression.plan.js";
-import { probeCompression, runCompression, type CompressionRun } from "./compression.js";
-import type { CompressionPlan, UnsupportedReason } from "./compression.types.js";
-import { h, clear, type Child } from "./dom.js";
-import { downloadBlob, downloadDataUrl } from "./download.js";
+import { cancelJob } from "./api.js";
+import { h, clear } from "./dom.js";
+import { downloadBlob } from "./download.js";
 import { setupFavicon } from "./favicon.js";
+import { buildForm, handleZipFile } from "./form.js";
+import { buildHeader } from "./header.js";
+import { formatBytes, frameDurationLabel } from "./format.js";
+import { buildHistoryRowSpecs, buildRowMedia } from "./historyList.js";
 import { estimateStorage } from "./history.js";
-import { thumbnailKey } from "./media.js";
+import { createLightbox } from "./lightbox.js";
+import { isHTMLElement, isInputElement, isVideoElement, maybeElement, reconcileRows, requiredElement } from "./list.js";
+import { getOrCreate, revokeRowMedia } from "./objectUrl.js";
 import { pump } from "./queue.js";
-import { GENERATION_PRESET } from "./request.js";
+import { buildQueueRowSpecs, moveQueueItem, updateLive } from "./queueList.js";
 import type { Store } from "./state.js";
-import { FALLBACK_DIMS } from "./state.js";
-import type { JobProgress } from "./api.js";
-import type { HistoryItem, QueueItem } from "./types.js";
-import { formatElapsed, sanitizeBasename, uid } from "./utils.js";
-import { analyzeZip, buildSourceZip } from "./zip.js";
-
-const isHTMLElement = (el: unknown): el is HTMLElement => el instanceof HTMLElement;
-const isInputElement = (el: unknown): el is HTMLInputElement => el instanceof HTMLInputElement;
-const isVideoElement = (el: unknown): el is HTMLVideoElement => el instanceof HTMLVideoElement;
-
-// One blob: URL per media key so a cached Blob maps to a stable URL; a key that already has a URL reuses it.
-// URLs are revoked only once the owning row leaves the DOM (see renderHistorySection), never while a live
-// <img>/<video> (e.g. an open <details> thumb or the lightbox) still references them.
-const mediaUrls = new Map<string, string>();
-
-function objectUrlFor(key: string, blob: Blob): string {
-	const existing = mediaUrls.get(key);
-	if (existing) return existing;
-	const url = URL.createObjectURL(blob);
-	mediaUrls.set(key, url);
-	return url;
-}
-
-function revokeIdMedia(id: string): void {
-	for (const key of [...mediaUrls.keys()]) {
-		if (key === id || key.startsWith(`${id}:`)) {
-			const url = mediaUrls.get(key);
-			if (url) URL.revokeObjectURL(url);
-			mediaUrls.delete(key);
-		}
-	}
-}
+import { buildStorageModal } from "./storage.js";
+import type { QueueItem } from "./types.js";
+import { uid } from "./utils.js";
+import { buildSourceZip } from "./zip.js";
 
 // History details that are loading (or loaded) their file thumbs, so a quick close/re-open does not double-load.
 const populating = new Set<string>();
-
-function frameDurationLabel(frames: number): string {
-	const seconds = frames / GENERATION_PRESET.fps;
-	return `≈ ${seconds.toFixed(1)} seconds`;
-}
-
-function requiredElement<T extends Element>(el: unknown, guard: (el: unknown) => el is T, what: string): T {
-	if (!guard(el)) throw new Error(`Required ${what} element is missing.`);
-	return el;
-}
-
-function maybeElement<T extends Element>(el: unknown, guard: (el: unknown) => el is T): T | null {
-	return guard(el) ? el : null;
-}
-
-function formatBytes(n: number): string {
-	if (!Number.isFinite(n) || n < 0) return "0 B";
-	if (n < 1024) return `${Math.round(n)} B`;
-	const units = ["KB", "MB", "GB", "TB"];
-	let value = n;
-	let unit = "KB";
-	for (const u of units) {
-		value /= 1024;
-		unit = u;
-		if (value < 1024) break;
-	}
-	const hasFraction = value < 10 && Math.floor(value) !== value;
-	return `${hasFraction ? value.toFixed(1) : Math.round(value)} ${unit}`;
-}
 
 export function mount(store: Store, root: HTMLElement): void {
 	let lastHistorySig = "";
@@ -120,108 +66,16 @@ export function mount(store: Store, root: HTMLElement): void {
 		storageRootEl.style.display = "block";
 		const usage = lastEstimate?.usage ?? 0;
 		const quota = lastEstimate?.quota ?? 0;
-		const items = store.history.items();
-		const slices = items.map((it, index) => ({
-			label: it.prompt,
-			value: historyItemBytes(it),
-			color: PIE_COLORS[index % PIE_COLORS.length] ?? PIE_COLORS[0] ?? "#5b8cff",
-		}));
-		const persistent = store.history.isPersistent();
-		const canvas = document.createElement("canvas");
-		canvas.className = "storage-pie";
-		const overlay = h("div", { class: "overlay storage-overlay" }, [
-			h("div", { class: "modal storage-modal" }, [
-				h("div", { class: "modal-head" }, [
-					h("h2", {}, "Storage"),
-					h("button", { class: "btn", "data-action": "close-storage" }, "Close"),
-				]),
-				canvas,
-				h("p", { class: "storage-summary" }, persistent ? `history saved in this browser · ${formatBytes(usage)} of ${formatBytes(quota)}` : "session-only history (not persisted)"),
-				h("div", { class: "storage-delete-oldest" }, [
-					h("label", { class: "storage-del-label" }, "Delete oldest history"),
-					h("div", { class: "storage-del-row" }, [
-						h("input", { type: "number", min: "1", value: "1", "data-delete-oldest-count": "", "aria-label": "How many oldest history items to delete" }),
-						h("button", { class: "btn small", "data-action": "delete-oldest" }, "Delete oldest"),
-					]),
-				]),
-				h("div", { class: "modal-actions" }, [
-					h("button", { class: "btn small danger", "data-action": "clear-history" }, "Clear all history"),
-				]),
-			]),
-		]);
-		storageRootEl.appendChild(overlay);
-		drawStoragePie(canvas, slices, usage, quota);
+		storageRootEl.appendChild(buildStorageModal(store, usage, quota));
 	};
 
-	const header = buildHeader();
-	const statusEl = requiredElement(header.querySelector(".status"), isHTMLElement, "status");
-	const storageEl = requiredElement(header.querySelector(".storage-note"), isHTMLElement, "storage note");
-	const storageTextEl = requiredElement(header.querySelector("[data-storage-text]"), isHTMLElement, "storage text");
-	const storageBarEl = requiredElement(header.querySelector("[data-storage-bar]"), isHTMLElement, "storage bar");
-	const storageFillEl = requiredElement(header.querySelector("[data-storage-fill]"), isHTMLElement, "storage fill");
-	const apiUrlEl = requiredElement(header.querySelector("[data-api-url]"), isHTMLElement, "api url");
-	const apiErrEl = maybeElement(header.querySelector("[data-api-err]"), isHTMLElement);
-	updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
-	let apiEditing = false;
-	let apiErrTimer: ReturnType<typeof setTimeout> | null = null;
-	const hideApiError = (): void => {
-		if (apiErrTimer != null) {
-			clearTimeout(apiErrTimer);
-			apiErrTimer = null;
-		}
-		if (apiErrEl) {
-			apiErrEl.textContent = "";
-			apiErrEl.classList.remove("show");
-		}
-	};
-	const showApiError = (msg: string): void => {
-		if (!apiErrEl) return;
-		apiErrEl.textContent = msg;
-		apiErrEl.classList.add("show");
-		if (apiErrTimer != null) clearTimeout(apiErrTimer);
-		apiErrTimer = setTimeout(hideApiError, 4000);
-	};
-	const endApiEdit = (): void => {
-		apiEditing = false;
-		clear(apiUrlEl);
-		apiUrlEl.textContent = getConfigurableBase();
-		hideApiError();
-	};
-	const beginApiEdit = (): void => {
-		if (apiEditing) return;
-		apiEditing = true;
-		clear(apiUrlEl);
-		const input = document.createElement("input");
-		input.type = "url";
-		input.value = getConfigurableBase();
-		input.spellcheck = false;
-		input.autocomplete = "off";
-		input.className = "api-url-input";
-		input.setAttribute("aria-label", "API server URL");
-		apiUrlEl.appendChild(input);
-		input.focus();
-		input.select();
-		input.addEventListener("keydown", (e) => {
-			if (e.key === "Enter") {
-				try {
-					store.setApiBase(input.value);
-					endApiEdit();
-				} catch (err) {
-					showApiError(err instanceof Error ? err.message : String(err));
-					input.focus();
-				}
-			} else if (e.key === "Escape") {
-				endApiEdit();
-			}
-		});
-		input.addEventListener("blur", () => {
-			if (apiEditing) endApiEdit();
-		});
-	};
-	apiUrlEl.addEventListener("click", beginApiEdit);
+	const header = buildHeader(store);
+	const storageTextEl = header.storageTextEl;
+	const storageBarEl = header.storageBarEl;
+	const storageFillEl = header.storageFillEl;
 
 	const app = h("div", { class: "app" }, [
-		header,
+		header.el,
 		buildLayout(),
 		h("div", { id: "lightbox-root" }),
 		h("div", { id: "storage-root" }),
@@ -236,6 +90,9 @@ export function mount(store: Store, root: HTMLElement): void {
 	const listEmptyEl = requiredElement(layout.querySelector("#listEmpty"), isHTMLElement, "list empty");
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
 	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
+	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to
+	// consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
+	const box = createLightbox(store, lightboxEl);
 
 	// List videos pause once they scroll out of view so many completed items do not all decode simultaneously.
 	// Visible rows keep their native autoplay.
@@ -280,178 +137,6 @@ export function mount(store: Store, root: HTMLElement): void {
 		observeListMedia(historyRowsEl);
 	};
 
-	// Lightbox: click the media preview or an input thumbnail anywhere in the list to view it enlarged, shrunk to fit the viewport.
-	// Clicking the backdrop closes it.
-	// The compressed plan/reason are filled in asynchronously by a probe once a video opens; until then the button stays disabled.
-	interface LightboxState {
-		kind: "image" | "video";
-		src: string;
-		filename: string;
-		stem: string;
-		plan: CompressionPlan | null;
-		reason: UnsupportedReason | null;
-		imageBlob?: Blob;
-	}
-	let lightbox: LightboxState | null = null;
-	const renderLightbox = (): void => {
-		clear(lightboxEl);
-		if (!lightbox) {
-			lightboxEl.style.display = "none";
-			return;
-		}
-		const lb = lightbox;
-		// The bar always reads "Download • Download Compressed • Close".
-		// Cancellation does not live here: a transient progress row (bar + Cancel) is managed imperatively below and exists only while a compression is running.
-		const barChildren: Child[] = [h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download")];
-		if (lb.kind === "video") {
-			const plan = lb.plan;
-			const ready = plan !== null;
-			// Informational tooltip: the plan label once a probe resolves, or a helpful note while disabled/unavailable.
-			const title = plan !== null ? planLabel(plan) : "Compression not available in this browser";
-			barChildren.push(
-				h("button", { class: "btn", "data-action": "download-compressed", disabled: !ready, title: title }, "Download Compressed"),
-			);
-		}
-		barChildren.push(h("button", { class: "btn", "data-action": "close-lightbox" }, "Close"));
-		lightboxEl.style.display = "block";
-		lightboxEl.appendChild(
-			h("div", { class: "overlay lightbox-overlay" }, [
-				// Column wrapper lets the button bar and progress row span the wider of the media or bar, centered like the rest of the lightbox.
-				h("div", { class: "lightbox-column" }, [
-					lb.kind === "video"
-						? h("video", { class: "lightbox-media", src: lb.src, controls: true, playsinline: true, autoplay: true })
-						: h("img", { class: "lightbox-media", src: lb.src, alt: "Enlarged media" }),
-					h("div", { class: "lightbox-bar" }, barChildren),
-				]),
-			]),
-		);
-	};
-	// Probe the resident blob once (idempotently) when a video lightbox opens, then enable the compress button if a plan is viable.
-	// Stale results (the lightbox changed or closed meanwhile) are ignored.
-	const probeVideoCompression = async (store: Store, lb: LightboxState): Promise<void> => {
-		const blob = store.residentBlob();
-		if (!blob) return;
-		try {
-			const outcome = await probeCompression(blob);
-			if (lightbox !== lb || lightbox.kind !== "video") return;
-			lightbox = { ...lightbox, plan: outcome.plan, reason: outcome.reason };
-			renderLightbox();
-		} catch {
-			if (lightbox !== lb || lightbox.kind !== "video") return;
-			lightbox = { ...lightbox, plan: null, reason: null };
-			renderLightbox();
-		}
-	};
-	// The compression currently running from the lightbox, if any.
-	// While this is set the lightbox is locked: closing and backdrop dismissal are refused and the download/close buttons are disabled.
-	// The delegated Cancel handler nulls this so the awaiting run's completion/cancellation bookkeeping is skipped.
-	let activeCompression: CompressionRun | null = null;
-	// Progress row is managed imperatively (not rebuilt by renderLightbox):
-	// renderLightbox re-renders the <video>, which would restart playback, so the row must be added/updated/removed directly in place around a single render.
-	let progressRowEl: HTMLElement | null = null;
-	let progressFillEl: HTMLElement | null = null;
-	let progressTextEl: HTMLElement | null = null;
-	let transientTimer: ReturnType<typeof setTimeout> | null = null;
-	const lightboxColumn = (): HTMLElement | null => maybeElement(lightboxEl.querySelector(".lightbox-column"), isHTMLElement);
-	const setLightboxControlsDisabled = (disabled: boolean): void => {
-		for (const action of ["download-lightbox", "download-compressed", "close-lightbox"]) {
-			const el = maybeElement(lightboxEl.querySelector(`[data-action="${action}"]`), isHTMLElement);
-			if (el) el.toggleAttribute("disabled", disabled);
-		}
-	};
-	const appendProgressRow = (): void => {
-		const column = lightboxColumn();
-		if (!column || progressRowEl) return;
-		const fill = h("div", { class: "lightbox-progress-fill", "data-compression-fill": "" });
-		const text = h("span", { class: "lightbox-progress-text", "data-compression-text": "" }, "0%");
-		const row = h("div", { class: "lightbox-progress" }, [
-			h("div", { class: "lightbox-progress-track" }, [fill]),
-			text,
-			h("button", { class: "btn small", "data-action": "cancel-compression" }, "Cancel"),
-		]);
-		column.appendChild(row);
-		progressRowEl = row;
-		progressFillEl = fill;
-		progressTextEl = text;
-	};
-	const removeProgressRow = (): void => {
-		progressRowEl?.remove();
-		progressRowEl = null;
-		progressFillEl = null;
-		progressTextEl = null;
-	};
-	const setProgress = (pct: number): void => {
-		if (progressFillEl) progressFillEl.style.width = `${pct * 100}%`;
-		if (progressTextEl) progressTextEl.textContent = `${Math.round(pct * 100)}%`;
-	};
-	const clearTransient = (): void => {
-		if (transientTimer != null) {
-			clearTimeout(transientTimer);
-			transientTimer = null;
-		}
-		lightboxEl.querySelector(".lightbox-message")?.remove();
-	};
-	const showTransientError = (message: string): void => {
-		clearTransient();
-		const column = lightboxColumn();
-		if (!column) return;
-		const node = h("div", { class: "lightbox-message", role: "alert" }, message);
-		column.appendChild(node);
-		transientTimer = setTimeout(() => node.remove(), 3500);
-	};
-	// Re-enable the locked controls and drop the progress row (which only ever exists for the duration of a run).
-	const unlockAfterCompression = (): void => {
-		removeProgressRow();
-		setLightboxControlsDisabled(false);
-	};
-	// Cancel helper: stops the active run, then unlocks the lightbox.
-	// Stale cancellations (lightbox changed/closed meanwhile) are handled gracefully by the guards: a run that no longer owns the slot does no bookkeeping.
-	const cancelCompressionFromLightbox = (): void => {
-		const run = activeCompression;
-		if (!run) return;
-		activeCompression = null;
-		run.cancel();
-		unlockAfterCompression();
-	};
-	// Run the compression for the currently-open video lightbox, drive the transient progress row, and hand the result to the browser on completion.
-	const runCompressionFromLightbox = async (store: Store): Promise<void> => {
-		const lb = lightbox;
-		if (!lb || lb.kind !== "video" || lb.plan === null) return;
-		if (activeCompression) return;
-		const blob = store.residentBlob();
-		if (!blob) return;
-		const plan = lb.plan;
-		// Lock the lightbox: disable the two download buttons and Close, and (via activeCompression) refuse backdrop dismissal and Close clicks.
-		clearTransient();
-		appendProgressRow();
-		setLightboxControlsDisabled(true);
-		setProgress(0);
-		const run = runCompression(blob, plan, { quality: "medium", stem: lb.stem });
-		activeCompression = run;
-		run.onProgress((pct) => {
-			if (activeCompression === run) setProgress(pct);
-		});
-		try {
-			const result = await run.done;
-			if (activeCompression !== run) return;
-			setProgress(1);
-			downloadBlob(result.blob, result.filename);
-			// Let the 100% readout paint for a beat before the row is removed and the controls re-enable.
-			setTimeout(() => {
-				if (activeCompression === run) {
-					activeCompression = null;
-					unlockAfterCompression();
-				}
-			}, 180);
-		} catch (err) {
-			if (activeCompression !== run) return;
-			// A canceled run reports "Compression canceled."; that is handled as a clean unlock, not an error.
-			const canceled = err instanceof Error && err.message === "Compression canceled.";
-			if (!canceled) showTransientError(`Compression failed: ${err instanceof Error ? err.message : String(err)}`);
-			activeCompression = null;
-			unlockAfterCompression();
-		}
-	};
 	// Capture-phase guard: interacting with a row's prompt block or actions (e.g. expanding the collapsed <details>) must not bubble into the history-row click.
 	// Elements that carry their own [data-action] (thumbnails, download buttons) still bubble normally.
 	app.addEventListener(
@@ -460,7 +145,6 @@ export function mount(store: Store, root: HTMLElement): void {
 			const target = event.target;
 			if (!(target instanceof HTMLElement)) return;
 			// Only swallow clicks that are not themselves actionable controls (thumbnails / download buttons) living inside the block.
-			// The row itself is no longer a click action, but we still only swallow clicks that are not actionable controls.
 			const block = target.closest(".prompt-block, .row-actions");
 			if (block && !target.closest(".prompt-block [data-action], .row-actions [data-action]")) {
 				event.stopPropagation();
@@ -477,79 +161,16 @@ export function mount(store: Store, root: HTMLElement): void {
 			renderStorageModal();
 			return;
 		}
-		// Clicking the overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
+		// The storage overlay carries both `overlay` and `storage-overlay`, so it is caught by the storage branch above and never reaches here.
+		// Clicking any other overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
 		if (target.classList.contains("overlay")) {
-			if (activeCompression) return;
-			lightbox = null;
-			renderLightbox();
+			box.handleBackdropClose();
 			return;
 		}
 		const actionEl = maybeElement(target.closest("[data-action]"), isHTMLElement);
 		if (!actionEl) return;
 		const action = actionEl.getAttribute("data-action");
-		if (action === "view-image") {
-			event.stopPropagation();
-			const name = actionEl.getAttribute("data-name") ?? "";
-			const id = actionEl.getAttribute("data-id") ?? "";
-			const fallback = actionEl.getAttribute("src") ?? "";
-			const show = (src: string, imageBlob?: Blob): void => {
-				if (!src) return;
-				const state: LightboxState = { kind: "image", src, filename: name || "image", stem: "", plan: null, reason: null };
-				if (imageBlob) state.imageBlob = imageBlob;
-				lightbox = state;
-				renderLightbox();
-			};
-			const item = store.history.items().find((i) => i.id === id);
-			const index = item ? item.files.findIndex((f) => f.name === name) : -1;
-			if (item && index >= 0) {
-				const file = item.files[index];
-				void store.history.loadFile(id, index).then((blob) => {
-					if (blob && file) show(objectUrlFor(file.key, blob), blob);
-					else show(fallback);
-				}).catch(() => show(fallback));
-			} else {
-				show(fallback);
-			}
-		} else if (action === "view-video") {
-			event.stopPropagation();
-			const id = actionEl.getAttribute("data-id") ?? "";
-			const item = store.history.items().find((i) => i.id === id);
-			const filename = item ? mediaDownloadName(item) : `${id || "media"}.webm`;
-			const stem = item ? (zipStem(item.zipName) || sanitizeBasename(item.prompt) || item.id) : id;
-			// Opening the full video clears this item's "new" highlight (and its green favicon contribution).
-			store.markHistoryViewed(id);
-			void (async () => {
-				await store.setResident(id);
-				const src = store.residentUrl();
-				if (src) {
-					lightbox = { kind: "video", src, filename, stem, plan: null, reason: null };
-					renderLightbox();
-					void probeVideoCompression(store, lightbox);
-				}
-			})();
-		} else if (action === "download-compressed") {
-			event.stopPropagation();
-			void runCompressionFromLightbox(store);
-		} else if (action === "cancel-compression") {
-			event.stopPropagation();
-			cancelCompressionFromLightbox();
-		} else if (action === "download-lightbox") {
-			event.stopPropagation();
-			if (!lightbox) return;
-			if (lightbox.kind === "video") {
-				const blob = store.residentBlob();
-				if (blob) downloadBlob(blob, lightbox.filename);
-			} else if (lightbox.imageBlob) {
-				downloadBlob(lightbox.imageBlob, lightbox.filename);
-			} else {
-				downloadDataUrl(lightbox.src, lightbox.filename);
-			}
-		} else if (action === "close-lightbox") {
-			// Closing is refused while a compression runs; the Close button is also disabled during that window.
-			if (activeCompression) return;
-			lightbox = null;
-			renderLightbox();
-		} else if (action === "open-storage") {
+		if (action === "open-storage") {
 			event.stopPropagation();
 			storageModalOpen = true;
 			renderStorageModal();
@@ -557,6 +178,9 @@ export function mount(store: Store, root: HTMLElement): void {
 			event.stopPropagation();
 			storageModalOpen = false;
 			renderStorageModal();
+		} else if (action !== null) {
+			// All remaining arms (image/video open, downloads, cancel, close) belong to the lightbox module.
+			box.handleAction(action, { event, element: actionEl });
 		}
 	});
 	// Hovering a history row's media preview makes that video the single resident one, unless the video modal is open.
@@ -566,7 +190,7 @@ export function mount(store: Store, root: HTMLElement): void {
 			const target = event.target;
 			if (!(target instanceof HTMLElement)) return;
 			// Keep the resident video stable while the video/player modal is open.
-			if (lightbox) return;
+			if (box.isOpen()) return;
 			const media = target.closest('.row-media[data-action="view-video"]');
 			if (!media) return;
 			const id = media.getAttribute("data-id") ?? "";
@@ -598,29 +222,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	// Unchanged rows keep their existing node (so an open <details> and the live [data-progress] bar survive),
 	// while changed or new rows are swapped for freshly built ones. The queue is small, so this stays synchronous.
 	function renderQueueSection(): void {
-		const rows = buildQueueRows(store);
-		const existing = new Map<string, HTMLElement>();
-		for (const row of queueRowsEl.querySelectorAll<HTMLElement>("li.job-row.queue")) {
-			existing.set(row.getAttribute("data-id") ?? "", row);
-		}
-		const wanted = new Set(rows.map((r) => r.getAttribute("data-id") ?? ""));
-		for (const [id, row] of existing) {
-			if (!wanted.has(id)) row.remove();
-		}
-		let prev: HTMLElement | null = null;
-		for (const row of rows) {
-			const id = row.getAttribute("data-id") ?? "";
-			const current = existing.get(id);
-			if (current && current.getAttribute("data-sig") === row.getAttribute("data-sig")) {
-				if (prev && current !== prev.nextSibling) queueRowsEl.insertBefore(current, prev.nextSibling);
-				else if (!prev && current !== queueRowsEl.firstChild) queueRowsEl.insertBefore(current, queueRowsEl.firstChild);
-				prev = current;
-			} else {
-				if (current) current.remove();
-				queueRowsEl.insertBefore(row, prev ? prev.nextSibling : queueRowsEl.firstChild);
-				prev = row;
-			}
-		}
+		reconcileRows(queueRowsEl, buildQueueRowSpecs(store), { rowSelector: "li.job-row.queue" });
 		observeListMedia(queueRowsEl);
 		updateListEmpty();
 	}
@@ -629,43 +231,18 @@ export function mount(store: Store, root: HTMLElement): void {
 	// A completion must add a single row and a view must remove a single highlight, without tearing down
 	// the other ~N rows (each of which embeds a large base64 thumbnail) — a full rebuild caused the post-generation studders.
 	function renderHistorySection(): void {
-		const items = [...store.history.items()].reverse();
-		const existing = new Map<string, HTMLElement>();
-		for (const row of historyRowsEl.querySelectorAll<HTMLElement>("li.job-row.history")) {
-			existing.set(row.getAttribute("data-id") ?? "", row);
-		}
-		const wanted = new Set(items.map((i) => i.id));
-		for (const [id, row] of existing) {
-			if (!wanted.has(id)) {
-				row.remove();
-				// Revoke this item's URLs only after its row left the DOM so no live media still references them.
-				revokeIdMedia(id);
-			}
-		}
-		// Reconcile in display (newest-first) order: insert missing rows in place, move rows that shifted, and toggle the "new" highlight in place.
-		let prev: HTMLElement | null = null;
-		for (const item of items) {
-			let row = existing.get(item.id);
-			if (!row) {
-				row = buildHistoryRow(store, item);
-				historyRowsEl.insertBefore(row, prev ? prev.nextSibling : historyRowsEl.firstChild);
-			} else {
-				row.classList.toggle("new", !item.viewed);
-				if (prev && row !== prev.nextSibling) {
-					historyRowsEl.insertBefore(row, prev.nextSibling);
-				} else if (!prev && row !== historyRowsEl.firstChild) {
-					historyRowsEl.insertBefore(row, historyRowsEl.firstChild);
-				}
-			}
-			prev = row;
-		}
+		reconcileRows(historyRowsEl, buildHistoryRowSpecs(store), {
+			rowSelector: "li.job-row.history",
+			// Revoke this item's URLs only after its row left the DOM so no live media still references them.
+			onRemoved: (id) => revokeRowMedia(id),
+		});
 		observeListMedia(historyRowsEl);
 		updateListEmpty();
 	}
 
 	// Subscribe per domain so a queue/progress/resident emission never scans the history list (and vice versa).
 	// The history renderer still gates on historySig(), but only runs when the `history` domain actually fired.
-	const renderHeader = (): void => updateHeader(store, statusEl, storageEl, apiUrlEl, apiErrEl);
+	const renderHeader = (): void => header.update(store);
 	const renderFormDomain = (): void => {
 		if (store.revs.form !== lastFormRev) {
 			lastFormRev = store.revs.form;
@@ -721,62 +298,6 @@ export function mount(store: Store, root: HTMLElement): void {
 	void pump(store);
 }
 
-function buildHeader(): HTMLElement {
-	return h("header", { class: "topbar" }, [
-		h("div", { class: "brand" }, [h("h1", {}, "Video Studio")]),
-		h("div", { class: "topbar-right" }, [
-			h("span", { class: "status warn" }, "Connecting…"),
-			h("div", { class: "api-inline" }, [
-				h("span", { class: "api-url", "data-api-url": "", title: "Click to edit the API server URL" }, ""),
-				h("span", { class: "api-err", "data-api-err": "" }, ""),
-			]),
-			h("div", { class: "storage-inline", "data-action": "open-storage", title: "Manage saved history and storage" }, [
-				h("span", { class: "storage-note" }, ""),
-				h("div", { class: "storage-meter", "data-storage-bar": "" }, [
-					h("div", { class: "storage-meter-fill", "data-storage-fill": "" }),
-				]),
-				h("span", { class: "storage-meta", "data-storage-text": "" }, ""),
-			]),
-		]),
-	]);
-}
-
-function updateHeader(store: Store, statusEl: HTMLElement, storageEl: HTMLElement, apiUrlEl: HTMLElement, apiErrEl: HTMLElement | null): void {
-	if (store.state.progressError) {
-		// The server is reachable but lacks the feature this UI requires; surface that clearly rather than silently degrading.
-		statusEl.textContent = "Online";
-		statusEl.className = "status warn";
-		statusEl.title = store.state.progressError;
-		if (apiErrEl) {
-			apiErrEl.textContent = store.state.progressError;
-			apiErrEl.className = "api-err show";
-		}
-	} else if (store.state.online) {
-		statusEl.textContent = "Online";
-		statusEl.className = "status ok";
-	} else if (store.state.capsError) {
-		statusEl.textContent = "Offline";
-		statusEl.className = "status warn";
-		statusEl.title = store.state.capsError;
-	} else {
-		statusEl.textContent = "Connecting…";
-		statusEl.className = "status warn";
-	}
-	if (apiErrEl && !store.state.progressError) {
-		apiErrEl.className = "api-err";
-		apiErrEl.textContent = "";
-	}
-	// Don't clobber an in-progress URL edit.
-	if (!apiUrlEl.querySelector("input")) apiUrlEl.textContent = getConfigurableBase();
-	if (store.history.isPersistent()) {
-		storageEl.textContent = "history saved";
-		storageEl.title = "History is saved in this browser.";
-	} else {
-		storageEl.textContent = "session-only history";
-		storageEl.title = "History is kept only for this session.";
-	}
-}
-
 function buildLayout(): HTMLElement {
 	return h("div", { id: "layout", class: "layout" }, [
 		h("section", { id: "form", class: "panel form-panel", "aria-label": "New generation" }),
@@ -786,302 +307,6 @@ function buildLayout(): HTMLElement {
 			h("p", { id: "listEmpty", class: "empty" }, "Nothing here yet."),
 		]),
 	]);
-}
-
-function buildForm(store: Store): HTMLElement {
-	const f = store.state.form;
-	const labels: Record<string, string> = {
-		prompt: "Text only",
-		"start-end": "Start/End frames",
-		refs: "Reference frames",
-	};
-
-	const notice: Child[] = f.analysis
-		? [
-			  h("div", { class: "badge" }, labels[f.analysis.mode] ?? f.analysis.mode),
-			  h("div", { class: "analysis" }, [
-				  h("div", { class: "analysis-row" }, [
-					  h("span", { class: "key" }, "prompt"),
-					  h("span", { class: "val prompt-preview" }, truncate(f.analysis.prompt, 240)),
-				  ]),
-				  f.analysis.files.length > 0
-					  ? h("div", { class: "analysis-row" }, [
-							h("span", { class: "key" }, "images"),
-							h("div", { class: "thumbs" },
-								f.analysis.files.map((file) =>
-									h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, decoding: "async", "data-action": "view-image", "data-name": file.name }),
-								)),
-						])
-					  : null,
-			  ]),
-		  ]
-		: [];
-
-	return h("div", { class: "inner" }, [
-		h("h2", {}, "New generation"),
-		h("div", { class: `dropzone ${f.parsing ? "busy" : ""}`, title: f.analysis ? (f.zipName ?? "zip loaded") : "Drop a .zip here or click to choose" }, [
-			h("input", { id: "zipFile", type: "file", accept: ".zip,application/x-zip-compressed,application/zip", class: "hidden" }),
-			h("div", { class: "dropzone-inner" }, [
-				h("p", { class: "dz-title" }, f.analysis ? "Zip loaded" : "Drop a .zip here"),
-				h("p", { class: "dz-sub" }, f.parsing ? "Reading zip…" : "or click to browse"),
-			]),
-		]),
-		...notice,
-		f.error ? h("div", { class: "form-error", role: "alert" }, f.error) : null,
-		h("div", { class: "dims" }, [
-			dimField("Width", "width", f.width, "width"),
-			dimField("Height", "height", f.height, "height"),
-			dimField("Frames", "frames", f.frames, "frames", frameDurationLabel(f.frames)),
-			dimField("Steps", "steps", f.steps, "steps"),
-		]),
-		h("div", { class: "actions" }, [
-			h("button", {
-				class: "btn primary",
-				type: "button",
-				disabled: !f.analysis || f.parsing,
-				"data-action": "add-queue",
-			}, "Add to queue"),
-		]),
-	]);
-}
-
-function dimField(label: string, name: string, value: number, aria: string, hint?: string): HTMLElement {
-	return h("label", { class: "field" }, [
-		h("span", {}, label),
-		h("input", {
-			type: "number",
-			name: name,
-			value: String(value),
-			min: "1",
-			step: "1",
-			"data-dim": name,
-			"aria-label": aria,
-		}),
-		hint ? h("span", { class: "field-hint", "data-dim-hint": name }, hint) : null,
-	]);
-}
-
-/**
- * Emit queue rows in display order: queued items (array order), then failed/cancelled items, then the single active item pinned last so it sits just above the history group.
- */
-function buildQueueRows(store: Store): HTMLElement[] {
-	const q = store.state.queue;
-	const queued = q.filter((i) => i.status === "queued");
-	const stuck = q.filter((i) => i.status === "failed" || i.status === "cancelled");
-	const active = q.filter((i) => i.status === "submitting" || i.status === "generating");
-
-	const rows: HTMLElement[] = [];
-	const progressOk = store.state.vidProgress;
-	queued.forEach((item, index) => rows.push(buildQueueRow(item, index, queued.length, progressOk)));
-	stuck.forEach((item) => rows.push(buildQueueRow(item, -1, 0, progressOk)));
-	active.forEach((item) => rows.push(buildQueueRow(item, -1, 0, progressOk)));
-	return rows;
-}
-
-// A stable fingerprint of a queue row's dynamic content, so renderQueueSection can reuse an existing node
-// (preserving its open <details> and live [data-progress]) unless its content actually changed.
-function queueRowSignature(item: QueueItem, queuedIndex: number, queuedCount: number, progressOk: boolean): string {
-	return JSON.stringify([item.status, item.error ?? null, item.startedAt ?? null, queuedIndex === 0, queuedIndex === queuedCount - 1, progressOk]);
-}
-
-function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0, progressOk = false): HTMLElement {
-	const isQueued = item.status === "queued";
-	const isActive = item.status === "submitting" || item.status === "generating";
-	const chip = h("span", { class: `chip ${item.status}` }, statusLabel(item));
-	const elapsed = isActive && item.startedAt != null ? h("span", { class: "elapsed", "data-elapsed": item.id }, formatElapsed(Date.now() - item.startedAt)) : isActive ? h("span", { class: "elapsed", "data-elapsed": item.id }, "…") : null;
-
-	const meta = h("div", { class: "job-meta" }, [
-		h("span", {}, `${item.width}×${item.height} · ${item.jobFrames}f · ${item.steps} steps`),
-		elapsed,
-	]);
-
-	const progress = item.status === "generating" && progressOk ? h("div", { class: "job-progress", "data-progress": item.id }, [
-		h("div", { class: "progress-track" }, [h("div", { class: "progress-fill", style: `width:${item.progress ? progressPercent(item.progress) : 0}%` })]),
-		h("span", { class: "progress-label" }, item.progress ? progressLabel(item.progress) : "Generating…"),
-	]) : null;
-
-	const promptBlock = h("details", { class: "prompt-block", "data-lazy-files": item.id, "data-files-kind": "queue" }, [
-		h("summary", {}, "Prompt"),
-		h("p", {}, item.prompt),
-		h("div", { class: "thumbs" }),
-		item.error ? h("p", { class: "item-error", role: "alert" }, item.error) : null,
-	]);
-
-	const actions: Child[] = [];
-	if (isQueued) {
-		actions.push(
-			h("button", { class: "btn small", "data-action": "move-up", "data-id": item.id, disabled: queuedIndex === 0 }, "▲"),
-			h("button", { class: "btn small", "data-action": "move-down", "data-id": item.id, disabled: queuedIndex === queuedCount - 1 }, "▼"),
-		);
-	}
-	if (isQueued || item.status === "failed" || item.status === "cancelled") {
-		actions.push(
-			h("button", {
-				class: "btn small danger",
-				"data-action": "remove-queue",
-				"data-id": item.id,
-				title: isActive ? "Cancel this job and remove it" : "Remove from queue",
-			}, "✕"),
-		);
-	}
-
-	const body: Child[] = [
-		h("div", { class: "row-head" }, [chip, h("div", { class: "row-title" }, truncate(itemTitle(item), 90))]),
-		meta,
-		...(progress ? [progress] : []),
-		promptBlock,
-	];
-	if (actions.length > 0) body.push(h("div", { class: "row-actions" }, actions));
-
-	return h("li", { class: `job-row queue ${item.status}`, "data-id": item.id, "data-sig": queueRowSignature(item, queuedIndex, queuedCount, progressOk) }, body);
-}
-
-// The non-resident row media is an <img> built without a src; its Blob is loaded on demand and attached in
-// place only once it resolves and the node is still connected. Building the list therefore loads no bytes.
-function attachRowThumb(store: Store, img: HTMLImageElement, id: string): void {
-	void store.history.loadThumbnail(id).then((blob) => {
-		if (!blob || !img.isConnected) return;
-		img.src = objectUrlFor(thumbnailKey(id), blob);
-	}).catch(() => {});
-}
-
-function buildRowMedia(store: Store, item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
-	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
-		return h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
-	}
-	const img = h("img", { class: "row-media", alt: item.prompt, decoding: "async", loading: "lazy", "data-action": "view-video", "data-id": item.id });
-	if (img instanceof HTMLImageElement) attachRowThumb(store, img, item.id);
-	return img;
-}
-
-// History rows always render their thumbnail (never the resident video); the resident <video> is attached in place by swapResidentMedia.
-// The resident id is attached to the <li> so renderHistorySection can reconcile rows by id without rebuilding them.
-function buildHistoryRow(store: Store, item: HistoryItem): HTMLElement {
-	const media = buildRowMedia(store, item, false, null);
-
-	return h("li", { class: item.viewed ? "job-row history" : "job-row history new", "data-id": item.id }, [
-		media,
-		h("div", { class: "row-body" }, [
-			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),
-			h("div", { class: "job-meta" }, [
-				h("span", {}, `${formatElapsed(item.elapsedMs)} · ${item.frameCount}f · ${item.width}×${item.height}`),
-				h("div", { class: "row-actions" }, [
-					h("button", {
-						class: "btn small",
-						"data-action": "download-zip",
-						"data-id": item.id,
-						title: "Download source zip",
-					}, "Download zip"),
-					h("button", {
-						class: "btn small danger",
-						"data-action": "delete-history",
-						"data-id": item.id,
-						title: "Remove this item",
-					}, "Delete"),
-				]),
-			]),
-			h("details", { class: "prompt-block", "data-lazy-files": item.id, "data-files-kind": "history" }, [
-				h("summary", {}, "Prompt"),
-				h("p", {}, item.prompt),
-				h("div", { class: "thumbs" }),
-			]),
-		]),
-	]);
-}
-
-/** The uploaded zip's filename with its trailing .zip extension stripped, or "" when absent. */
-function zipStem(name: string | null): string {
-	return name?.replace(/\.zip$/i, "") ?? "";
-}
-
-/** Human-facing title for a row/item: the zip filename (minus extension), falling back to the prompt then the id. */
-function itemTitle(item: { prompt: string; id: string; zipName: string | null }): string {
-	return zipStem(item.zipName) || item.prompt || item.id;
-}
-
-/** Derive a download filename for a history item's media preview from its zip name (or prompt) and output format. */
-function mediaDownloadName(item: HistoryItem): string {
-	const stem = zipStem(item.zipName) || sanitizeBasename(item.prompt) || item.id;
-	return `${stem}.${item.video.format}`;
-}
-
-const PIE_COLORS = ["#5b8cff", "#e6b45c", "#4cc38a", "#e0605f", "#c678dd", "#7aa3b0"];
-
-function historyItemBytes(item: HistoryItem): number {
-	return item.video.byteSize + item.thumbBytes + item.files.reduce((n, f) => n + f.bytes, 0);
-}
-
-function drawStoragePie(canvas: HTMLCanvasElement, slices: { value: number; color: string }[], usage: number, quota: number): void {
-	const size = 220;
-	canvas.width = size;
-	canvas.height = size;
-	const ctx = canvas.getContext("2d");
-	if (!ctx) return;
-	const cx = size / 2;
-	const cy = size / 2;
-	const r = 88;
-	const total = quota > 0 ? quota : usage > 0 ? usage : 1;
-	const used = usage > 0 ? usage : 0;
-	const itemTotal = slices.reduce((n, s) => n + s.value, 0);
-	let start = -Math.PI / 2;
-	if (itemTotal > 0 && used > 0) {
-		for (const s of slices) {
-			const angle = ((used * (s.value / itemTotal)) / total) * Math.PI * 2;
-			ctx.beginPath();
-			ctx.moveTo(cx, cy);
-			ctx.arc(cx, cy, r, start, start + angle);
-			ctx.closePath();
-			ctx.fillStyle = s.color;
-			ctx.fill();
-			start += angle;
-		}
-	}
-	const otherVal = itemTotal === 0 ? used : used - itemTotal;
-	if (otherVal > 0) {
-		const angle = (otherVal / total) * Math.PI * 2;
-		if (angle > 0) {
-			ctx.beginPath();
-			ctx.moveTo(cx, cy);
-			ctx.arc(cx, cy, r, start, start + angle);
-			ctx.closePath();
-			ctx.fillStyle = "#333a47";
-			ctx.fill();
-			start += angle;
-		}
-	}
-	if (total > used) {
-		const angle = ((total - used) / total) * Math.PI * 2;
-		ctx.beginPath();
-		ctx.moveTo(cx, cy);
-		ctx.arc(cx, cy, r, start, start + angle);
-		ctx.closePath();
-		ctx.fillStyle = "#222832";
-		ctx.fill();
-	}
-	ctx.fillStyle = "#e6e9ee";
-	ctx.font = "bold 18px system-ui, sans-serif";
-	ctx.textAlign = "center";
-	ctx.textBaseline = "middle";
-	ctx.fillText(formatBytes(usage), cx, cy);
-}
-
-async function handleZipFile(store: Store, file: File): Promise<void> {
-	store.setForm({ parsing: true, error: null });
-	try {
-		const analysis = await analyzeZip(file, file.name);
-		const form = store.state.form;
-		// Prefill dimensions from server defaults only if the user has not customized them (fields are still at the fallback values).
-		const caps = store.state.caps?.defaults_by_mode?.vid_gen;
-		store.setForm({
-			analysis,
-			zipName: file.name,
-			parsing: false,
-			width: form.width === FALLBACK_DIMS.width && caps?.width ? caps.width : form.width,
-			height: form.height === FALLBACK_DIMS.height && caps?.height ? caps.height : form.height,
-		});
-	} catch (err) {
-		store.setForm({ parsing: false, error: err instanceof Error ? err.message : String(err) });
-	}
 }
 
 function setupDelegated(store: Store, root: HTMLElement): void {
@@ -1096,9 +321,15 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 			case "add-queue":
 				addToQueue(store);
 				break;
-			case "remove-queue":
+			case "remove-queue": {
+				const item = store.state.queue.find((i) => i.id === id);
+				// Removing a running (submitting/generating) item is a best-effort server-side cancel so the job is not left running orphaned server-side.
+				if (item?.serverId && (item.status === "submitting" || item.status === "generating")) {
+					void cancelJob(item.serverId).catch(() => {});
+				}
 				store.removeQueue(id);
 				break;
+			}
 			case "move-up":
 			case "move-down":
 				moveQueueItem(store, id, action === "move-up" ? -1 : 1);
@@ -1158,7 +389,7 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 					const liveContainer = liveRow ? maybeElement(liveRow.querySelector(".thumbs"), isHTMLElement) : null;
 					if (!blob || !liveContainer || !liveContainer.isConnected) return;
 					const img = h("img", { class: "thumb", alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" });
-					if (img instanceof HTMLImageElement) img.src = objectUrlFor(file.key, blob);
+					if (img instanceof HTMLImageElement) img.src = getOrCreate(file.key, blob);
 					liveContainer.appendChild(img);
 				}).finally(() => {
 					remaining -= 1;
@@ -1276,94 +507,16 @@ function addToQueue(store: Store): void {
 	void pump(store);
 }
 
-function moveQueueItem(store: Store, id: string, delta: number): void {
-	const index = store.state.queue.findIndex((i) => i.id === id);
-	if (index < 0) return;
-	// Only queued items may be reordered, and only by swapping with an immediately adjacent queued item (never crossing failed/cancelled/active).
-	const source = store.state.queue[index];
-	if (!source || source.status !== "queued") return;
-	const target = index + delta;
-	if (target < 0 || target >= store.state.queue.length) return;
-	const neighbor = store.state.queue[target];
-	if (!neighbor || neighbor.status !== "queued") return;
-	store.moveQueue(index, target);
-}
-
-function updateElapsed(store: Store): void {
-	for (const item of store.state.queue) {
-		if (item.status !== "generating" || item.startedAt === null) continue;
-		const el = document.querySelector(`[data-elapsed="${CSS.escape(item.id)}"]`);
-		if (el) el.textContent = formatElapsed(Date.now() - item.startedAt);
-	}
-}
-
-function updateProgress(store: Store): void {
-	for (const item of store.state.queue) {
-		if (item.status !== "generating" || !item.progress) continue;
-		const root = document.querySelector(`[data-progress="${CSS.escape(item.id)}"]`);
-		if (!root) continue;
-		const fill = root.querySelector(".progress-fill");
-		const label = root.querySelector(".progress-label");
-		if (fill instanceof HTMLElement) fill.style.width = progressPercent(item.progress) + "%";
-		if (label) label.textContent = progressLabel(item.progress);
-	}
-}
-
-/** Refresh both live timers and progress bars in place (runs every second). */
-function updateLive(store: Store): void {
-	updateElapsed(store);
-	updateProgress(store);
-}
-
-function progressPercent(progress: JobProgress): number {
-	if (!Number.isFinite(progress.step) || !Number.isFinite(progress.steps) || progress.steps <= 0) return 0;
-	return Math.max(0, Math.min(100, (progress.step / progress.steps) * 100));
-}
-
-function stepSpeed(seconds: number): string | null {
-	if (!Number.isFinite(seconds) || seconds <= 0) return null;
-	// High throughput reads better as a per-second rate than as a tiny s/step figure.
-	if (seconds < 0.05) return `${(1 / seconds).toFixed(0)} steps/s`;
-	return `${seconds.toFixed(2)} s/step`;
-}
-
-function progressLabel(progress: JobProgress): string {
-	const speed = stepSpeed(progress.time);
-	return `Step ${progress.step} of ${progress.steps}${speed ? ` · ${speed}` : ""}`;
-}
-
-function statusLabel(item: QueueItem): string {
-	switch (item.status) {
-		case "queued":
-			return "Queued";
-		case "submitting":
-			return "Submitting";
-		case "generating":
-			return "Generating";
-		case "completed":
-			return "Done";
-		case "failed":
-			return "Failed";
-		case "cancelled":
-			return "Cancelled";
-		default:
-			return item.status;
-	}
-}
-
-function truncate(value: string, max: number): string {
-	return value.length > max ? `${value.slice(0, max)}…` : value;
-}
-
 async function downloadSourceZip(store: Store, id: string): Promise<void> {
 	const item = store.history.items().find((i) => i.id === id);
 	if (!item) return;
 	// Load each persisted input file's Blob on demand and rebuild the source zip from its bytes.
+	// Load by the file's recorded media-store key, never by a renumbered array index: a legacy
+	// record's keys can be non-contiguous with the array, and an index read would drop files from the zip.
 	const source: { name: string; bytes: Uint8Array }[] = [];
-	for (let i = 0; i < item.files.length; i++) {
-		const file = item.files[i];
-		if (!file) continue;
-		const blob = await store.history.loadFile(id, i);
+	for (const file of item.files) {
+		// A missing blob is skipped gracefully; the rest of the files still land in the zip.
+		const blob = await store.history.loadFileByKey(file.key);
 		if (!blob) continue;
 		source.push({ name: file.name, bytes: new Uint8Array(await blob.arrayBuffer()) });
 	}

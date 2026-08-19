@@ -78,6 +78,25 @@ describe("queue persistence WRITE -> backend -> reload round trip", () => {
 		expect(rQueued?.serverId).toBeNull();
 	});
 
+	it("persists a shallow copy without the transient progress field", async () => {
+		const backend = memoryQueueBackend();
+		const store = createStore(backend);
+		const item = queued("q_PROG");
+		store.pushQueue(item);
+		store.setQueueProgress(item.id, { step: 2, steps: 10, time: 1 });
+		// Patching some other field persists the whole array en route to IndexedDB.
+		store.patchQueueItem(item.id, { startedAt: 1700000000000 });
+		await store.queueReady;
+
+		// The in-memory item keeps its live progress...
+		expect(store.state.queue.find((i) => i.id === item.id)?.progress).toEqual({ step: 2, steps: 10, time: 1 });
+		// ...but the persisted payload must never carry it.
+		const persisted = await backend.load();
+		const p = persisted.find((i) => i.id === item.id);
+		expect(p).toBeDefined();
+		expect(p).not.toHaveProperty("progress");
+	});
+
 	it("backend save then load round-trips the same items", async () => {
 		const backend = memoryQueueBackend();
 		const list = [queued("qA"), queued("qB")];

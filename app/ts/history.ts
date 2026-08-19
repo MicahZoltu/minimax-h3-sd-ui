@@ -7,8 +7,8 @@
 //
 // This module also owns the queue persistence backend contract and the storage-usage estimator.
 
-import { fileKey, thumbnailKey, videoKey } from "./media.js";
-import type { HistoryItem, QueueItem, QueueStatus } from "./types.js";
+import { fileKey, fileKeyPrefix, thumbnailKey, videoKey } from "./media.js";
+import type { HistoryItem, QueueItem, QueueStatus, ZipMode } from "./types.js";
 
 export interface SyncStorage {
 	getItem(key: string): string | null;
@@ -26,6 +26,15 @@ export interface SyncStorage {
 const MAX_IN_MEMORY = 100;
 
 const QUEUE_STATUSES: QueueStatus[] = ["queued", "submitting", "generating", "completed", "failed", "cancelled"];
+const ZIP_MODES = ["prompt", "start-end", "refs"];
+
+function isZipMode(value: string): value is ZipMode {
+	return ZIP_MODES.includes(value);
+}
+
+function isFiniteNumber(n: unknown): n is number {
+	return typeof n === "number" && Number.isFinite(n);
+}
 
 export function isQueueItem(value: unknown): value is QueueItem {
 	if (typeof value !== "object" || value === null) return false;
@@ -34,14 +43,18 @@ export function isQueueItem(value: unknown): value is QueueItem {
 	if (typeof value.status !== "string" || !QUEUE_STATUSES.includes(value.status as QueueStatus)) return false;
 	if (typeof value.prompt !== "string") return false;
 	if (!("width" in value) || !("height" in value) || !("jobFrames" in value) || !("steps" in value)) return false;
-	if (typeof value.width !== "number" || typeof value.height !== "number") return false;
-	if (typeof value.jobFrames !== "number" || typeof value.steps !== "number") return false;
+	// The dimension/step fields feed the request form and generation math; the app's own form only allows
+	// width/height/steps/jobFrames of at least 1, so a non-finite, negative, or zero value is malformed and must be rejected.
+	if (!isFiniteNumber(value.width) || value.width <= 0) return false;
+	if (!isFiniteNumber(value.height) || value.height <= 0) return false;
+	if (!isFiniteNumber(value.jobFrames) || value.jobFrames <= 0) return false;
+	if (!isFiniteNumber(value.steps) || value.steps <= 0) return false;
 	if (!("files" in value) || !Array.isArray(value.files)) return false;
 	if (value.files.some((f) => typeof f !== "object" || f === null || !("name" in f) || !("dataUrl" in f) || typeof f.name !== "string" || typeof f.dataUrl !== "string")) return false;
 	if (!("serverId" in value) || (value.serverId !== null && typeof value.serverId !== "string")) return false;
-	if (!("startedAt" in value) || (value.startedAt !== null && typeof value.startedAt !== "number")) return false;
+	if (!("startedAt" in value) || (value.startedAt !== null && !isFiniteNumber(value.startedAt))) return false;
 	if (!("error" in value) || (value.error !== null && typeof value.error !== "string")) return false;
-	if (!("mode" in value) || typeof value.mode !== "string") return false;
+	if (!("mode" in value) || typeof value.mode !== "string" || !isZipMode(value.mode)) return false;
 	if (!("zipName" in value) || (value.zipName !== null && typeof value.zipName !== "string")) return false;
 	return true;
 }
@@ -50,6 +63,10 @@ export function isHistoryItem(value: unknown): value is HistoryItem {
 	if (typeof value !== "object" || value === null) return false;
 	if (!("id" in value) || !("createdAt" in value) || !("thumbnailKey" in value) || !("thumbBytes" in value) || !("video" in value)) return false;
 	if (typeof value.id !== "string" || typeof value.createdAt !== "number" || typeof value.thumbnailKey !== "string" || typeof value.thumbBytes !== "number") return false;
+	// The dimension/frame/timing fields feed ${width}×${height} and duration rendering; a missing or
+	// non-finite value would render as undefined, so reject the record outright like isQueueItem's rigor.
+	if (!("width" in value) || !("height" in value) || !("frameCount" in value) || !("fps" in value) || !("elapsedMs" in value) || !("startedAt" in value) || !("completedAt" in value)) return false;
+	if (!isFiniteNumber(value.width) || !isFiniteNumber(value.height) || !isFiniteNumber(value.frameCount) || !isFiniteNumber(value.fps) || !isFiniteNumber(value.elapsedMs) || !isFiniteNumber(value.startedAt) || !isFiniteNumber(value.completedAt)) return false;
 	const video = value.video;
 	if (typeof video !== "object" || video === null) return false;
 	if (!("mime" in video) || !("format" in video) || !("byteSize" in video)) return false;
@@ -86,10 +103,9 @@ export interface HistoryStore {
 	isPersistent(): boolean;
 	loadVideo(id: string): Promise<Blob | null>;
 	loadThumbnail(id: string): Promise<Blob | null>;
-	loadFile(id: string, index: number): Promise<Blob | null>;
 	/**
 	 * Load a persisted file Blob by its recorded media-store key (the authoritative index, from `file.key`).
-	 * Unlike loadFile(id, index), this does not re-derive the key from a renumbered array position, so it cannot
+	 * The key is authoritative: it does not re-derive the key from a renumbered array position, so it cannot
 	 * miss a blob when a record's file keys are not contiguous with its array indexes (e.g. after a legacy migration).
 	 */
 	loadFileByKey(key: string): Promise<Blob | null>;
@@ -97,7 +113,7 @@ export interface HistoryStore {
 	load(): Promise<void>;
 }
 
-export function createHistoryStore(backend: HistoryBackend | null): HistoryStore {
+export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?: (id: string) => void): HistoryStore {
 	const items: HistoryItem[] = [];
 	// In-memory byte cache keyed by media-store key.
 	// It backs the non-persistent path (private browsing / failed writes must still show images) and
@@ -116,10 +132,13 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		return blob;
 	};
 
-	const evictItemMedia = (id: string, fileCount: number): void => {
+	const evictItemMedia = (id: string): void => {
 		mediaCache.delete(videoKey(id));
 		mediaCache.delete(thumbnailKey(id));
-		for (let i = 0; i < fileCount; i++) mediaCache.delete(fileKey(id, i));
+		// Drop every cached file key by its shared prefix so legacy non-contiguous keys are evicted as well.
+		for (const key of mediaCache.keys()) {
+			if (key.startsWith(fileKeyPrefix(id))) mediaCache.delete(key);
+		}
 	};
 
 	let loadPromise: Promise<void> | null = null;
@@ -152,7 +171,12 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		const excess = items.length - MAX_IN_MEMORY;
 		if (excess <= 0) return;
 		const evicted = items.slice(0, excess);
-		for (const item of evicted) evictItemMedia(item.id, item.files.length);
+		for (const item of evicted) {
+			evictItemMedia(item.id);
+			// Surface the eviction so a caller can release the store "resident" object URL / Blob
+			// when the item currently shown full-size leaves memory (otherwise it leaks for the session).
+			onEvictItem?.(item.id);
+		}
 		items.splice(0, excess);
 	}
 
@@ -198,9 +222,6 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		loadThumbnail(id: string): Promise<Blob | null> {
 			return loadMedia(thumbnailKey(id));
 		},
-		loadFile(id: string, index: number): Promise<Blob | null> {
-			return loadMedia(fileKey(id, index));
-		},
 		loadFileByKey(key: string): Promise<Blob | null> {
 			return loadMedia(key);
 		},
@@ -217,10 +238,8 @@ export function createHistoryStore(backend: HistoryBackend | null): HistoryStore
 		remove(id: string): void {
 			const idx = items.findIndex((i) => i.id === id);
 			if (idx < 0) return;
-			const removed = items[idx];
-			const fileCount = removed ? removed.files.length : 0;
 			items.splice(idx, 1);
-			evictItemMedia(id, fileCount);
+			evictItemMedia(id);
 			if (backend) {
 				backend.remove(id).catch(() => {
 					// ignore

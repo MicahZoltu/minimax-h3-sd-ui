@@ -85,7 +85,7 @@ function flushToFresh(backend: MemoryHistoryBackend): HistoryStore {
 }
 
 describe("history media externalization round trip", () => {
-	it("new-item path (a): add() persists blobs by fileKey/thumbnailKey and loadFile resolves the same bytes", async () => {
+	it("new-item path (a): add() persists blobs by fileKey/thumbnailKey and loadFileByKey resolves the same bytes", async () => {
 		const backend = memoryHistoryBackend();
 		const store = createHistoryStore(backend);
 		const id = "h_add_path";
@@ -100,9 +100,9 @@ describe("history media externalization round trip", () => {
 		expect(item.files[0]?.key).toBe(fileKey(id, 0));
 		expect(item.files[1]?.key).toBe(fileKey(id, 1));
 
-		// Cache hit: loadFile returns the exact Blob objects stored for the derived keys.
-		expect(await store.loadFile(id, 0)).toBe(fileA);
-		expect(await store.loadFile(id, 1)).toBe(fileB);
+		// Cache hit: loadFileByKey returns the exact Blob objects stored for the derived keys.
+		expect(await store.loadFileByKey(item.files[0]?.key ?? "")).toBe(fileA);
+		expect(await store.loadFileByKey(item.files[1]?.key ?? "")).toBe(fileB);
 		expect(await store.loadThumbnail(id)).toBe(thumb);
 
 		// Persistence hit: the backend resolved those same keys to the stored blobs (same bytes).
@@ -133,12 +133,40 @@ describe("history media externalization round trip", () => {
 		const hydrated = store.items()[0];
 		if (!hydrated) throw new Error("item missing");
 
-		// Array-index loadFile(id, 1) re-derives file:1 (no blob); the consumer must use the recorded key instead.
-		expect(await store.loadFile(id, 1)).toBeNull();
+		// The array-index API that re-derived file:1 has been removed; the consumer loads by the recorded key.
+		expect(await store.loadFileByKey(fileKey(id, 1))).toBeNull();
 		for (const file of hydrated.files) {
 			const blob = await store.loadFileByKey(file.key);
 			expect(blob).not.toBeNull();
 		}
 		expect((await store.loadFileByKey(hydrated.files[1]?.key ?? ""))?.size).toBe(2);
+	});
+
+	it("downloadSourceZip-style iteration collects every file blob via its recorded key, none dropped", async () => {
+		// Reworked from the same non-contiguous fixture: downloadSourceZip iterates item.files and loads
+		// each by file.key. The legacy record skips index 1 (keys 0 and 2), so a renumbered array-index
+		// read would miss the second file and drop it from the regenerated zip.
+		const id = "h_zip";
+		const item = makeItem({ id, files: [{ name: "a.png", key: fileKey(id, 0), bytes: 2 }, { name: "c.png", key: fileKey(id, 2), bytes: 2 }] });
+		const backend = memoryHistoryBackend();
+		await backend.save(item, new Blob(["v"]));
+		await backend.storeMedia(fileKey(id, 0), new Blob(["Aa"], { type: "image/png" }));
+		await backend.storeMedia(fileKey(id, 2), new Blob(["Cc"], { type: "image/png" }));
+
+		const store = flushToFresh(backend);
+		await store.load();
+		const hydrated = store.items()[0];
+		if (!hydrated) throw new Error("item missing");
+
+		const source: { name: string; bytes: Uint8Array }[] = [];
+		for (const file of hydrated.files) {
+			const blob = await store.loadFileByKey(file.key);
+			if (!blob) throw new Error("a file was dropped");
+			source.push({ name: file.name, bytes: new Uint8Array(await blob.arrayBuffer()) });
+		}
+		// Both files survive, in recorded order, with the right key-derived bytes.
+		expect(source.map((f) => f.name)).toEqual(["a.png", "c.png"]);
+		expect(new TextDecoder().decode(source[0]?.bytes ?? new Uint8Array())).toBe("Aa");
+		expect(new TextDecoder().decode(source[1]?.bytes ?? new Uint8Array())).toBe("Cc");
 	});
 });

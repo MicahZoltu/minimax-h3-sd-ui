@@ -173,6 +173,43 @@ describe("QueueBackend", () => {
 		expect(isQueueItem({ id: "x" })).toBe(false);
 	});
 
+	it("isQueueItem rejects a persisted record carrying an invalid mode", async () => {
+		const good = makeQueueItem();
+		expect(isQueueItem({ ...good, mode: "start-end" })).toBe(true);
+		expect(isQueueItem({ ...good, mode: "refs" })).toBe(true);
+		expect(isQueueItem({ ...good, mode: "bogus" })).toBe(false);
+	});
+
+	it("isQueueItem applies finite, positive rigor to the dimension/step fields like isHistoryItem does", () => {
+		const good = makeQueueItem();
+		expect(isQueueItem(good)).toBe(true);
+		// Non-finite, negative, and zero dimension/step values are malformed and must be rejected.
+		expect(isQueueItem({ ...good, width: Number.NaN })).toBe(false);
+		expect(isQueueItem({ ...good, width: Number.POSITIVE_INFINITY })).toBe(false);
+		expect(isQueueItem({ ...good, width: -5 })).toBe(false);
+		expect(isQueueItem({ ...good, width: 0 })).toBe(false);
+		expect(isQueueItem({ ...good, height: Number.NaN })).toBe(false);
+		expect(isQueueItem({ ...good, height: -1 })).toBe(false);
+		expect(isQueueItem({ ...good, height: 0 })).toBe(false);
+		expect(isQueueItem({ ...good, steps: Number.NaN })).toBe(false);
+		expect(isQueueItem({ ...good, steps: 0 })).toBe(false);
+		expect(isQueueItem({ ...good, steps: -5 })).toBe(false);
+		expect(isQueueItem({ ...good, jobFrames: Number.NaN })).toBe(false);
+		expect(isQueueItem({ ...good, jobFrames: 0 })).toBe(false);
+		expect(isQueueItem({ ...good, jobFrames: -5 })).toBe(false);
+		// A complete valid record with all four fields present and positive passes.
+		expect(isQueueItem({ ...good, width: 512, height: 256, steps: 10, jobFrames: 30 })).toBe(true);
+	});
+
+	it("isQueueItem rejects a non-finite startedAt like the dimension rigor", () => {
+		const good = makeQueueItem();
+		// null (still pending) and a finite timestamp are both accepted; only the non-finite number case is rejected.
+		expect(isQueueItem({ ...good, startedAt: null })).toBe(true);
+		expect(isQueueItem({ ...good, startedAt: 1700000000000 })).toBe(true);
+		expect(isQueueItem({ ...good, startedAt: Number.POSITIVE_INFINITY })).toBe(false);
+		expect(isQueueItem({ ...good, startedAt: Number.NaN })).toBe(false);
+	});
+
 	it("never throws on load or save", async () => {
 		const backend = memoryQueueBackend();
 		await expect(backend.save([makeQueueItem()])).resolves.toBeUndefined();
@@ -225,6 +262,28 @@ describe("estimateStorage", () => {
 	it("does not throw and returns null without a storage backend", async () => {
 		const estimate = await estimateStorage();
 		expect(estimate).toBe(null);
+	});
+});
+
+describe("isHistoryItem numeric-field rigor", () => {
+	it("accepts a complete valid record", () => {
+		expect(isHistoryItem(makeItem())).toBe(true);
+	});
+
+	it("rejects when width is missing so the UI dimension never renders undefined", () => {
+		const { width: _width, ...rest } = makeItem();
+		expect(isHistoryItem(rest)).toBe(false);
+	});
+
+	it("rejects when frameCount is missing", () => {
+		const { frameCount: _frameCount, ...rest } = makeItem();
+		expect(isHistoryItem(rest)).toBe(false);
+	});
+
+	it("rejects when a required numeric field is not finite", () => {
+		expect(isHistoryItem({ ...makeItem(), width: Number.NaN })).toBe(false);
+		expect(isHistoryItem({ ...makeItem(), elapsedMs: Number.POSITIVE_INFINITY })).toBe(false);
+		expect(isHistoryItem({ ...makeItem(), completedAt: Number.NaN })).toBe(false);
 	});
 });
 
@@ -290,8 +349,8 @@ describe("createHistoryStore", () => {
 		await backend.storeMedia(fileKey(id, 0), new Blob(["f0"]));
 		await store.load();
 
-		const first = await store.loadFile(id, 0);
-		const second = await store.loadFile(id, 0);
+		const first = await store.loadFileByKey(item.files[0]?.key ?? "");
+		const second = await store.loadFileByKey(item.files[0]?.key ?? "");
 		expect(first).not.toBeNull();
 		expect(second).toBe(first);
 		expect(backend.mediaReadCount(fileKey(id, 0))).toBe(1);
@@ -303,7 +362,7 @@ describe("createHistoryStore", () => {
 		const item = { ...makeItem({ id }), files: [{ name: "a.png", key: fileKey(id, 0), bytes: 2 }] };
 		store.add(item, { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [new Blob(["f0"])] });
 		const thumb = await store.loadThumbnail(id);
-		const file = await store.loadFile(id, 0);
+		const file = await store.loadFileByKey(item.files[0]?.key ?? "");
 		expect(thumb).not.toBeNull();
 		expect(file).not.toBeNull();
 	});
@@ -360,8 +419,8 @@ describe("createHistoryStore", () => {
 		expect(backend.media(fileKey(id, 1))).toBeNull();
 		expect(await store.loadVideo(id)).toBeNull();
 		expect(await store.loadThumbnail(id)).toBeNull();
-		expect(await store.loadFile(id, 0)).toBeNull();
-		expect(await store.loadFile(id, 1)).toBeNull();
+		expect(await store.loadFileByKey(fileKey(id, 0))).toBeNull();
+		expect(await store.loadFileByKey(fileKey(id, 1))).toBeNull();
 	});
 
 	it("treats legacy persisted items without a viewed flag as already viewed on rehydrate", async () => {

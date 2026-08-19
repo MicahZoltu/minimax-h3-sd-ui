@@ -33,8 +33,9 @@ const THUMB_QUALITY = 0.7;
 const THUMB_TYPE = "image/jpeg";
 
 // Decode a worker message back into an ImageData frame, pulling the encode knobs with safe defaults.
-// A transferred ImageData arrives as a cloneable plain record ({width, height, data}); the decoded
-// bytes are a Uint8ClampedArray whose length is already exactly width*height*4, so handing it straight
+// The frame is read through plain property access: it arrives either structured-cloned (a real ImageData, exposing
+// width/height/data) or transferred (a cloneable {width, height, data} record), and both shapes expose the same three fields.
+// The decoded bytes are a Uint8ClampedArray whose length is already exactly width*height*4, so handing it straight
 // back to the ImageData constructor (rather than re-viewing the buffer with an element-count length)
 // is what keeps a real frame from throwing a RangeError.
 export function resolveThumbnailRequest(data: unknown): ParsedThumbnailRequest | null {
@@ -61,6 +62,39 @@ export function resolveThumbnailRequest(data: unknown): ParsedThumbnailRequest |
 let thumbnailWorker: Worker | null = null;
 let nextThumbId = 0;
 let pendingThumb: { id: number; resolve: (blob: Blob) => void; reject: (err: Error) => void } | null = null;
+// A worker encode that never posts a terminal reply must not hold its caller forever.
+// After this long the coordinator rejects the pending encode, so encodeThumbnail falls back to the main-thread encode.
+const THUMB_WATCHDOG_MS = 5000;
+// Watchdog for whichever encode currently owns the pending slot.
+let thumbWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+// Clears the watchdog on any settle.
+// An encode that legitimately finished must never be disturbed by a stale timer.
+function clearThumbWatchdog(): void {
+	if (thumbWatchdog != null) {
+		clearTimeout(thumbWatchdog);
+		thumbWatchdog = null;
+	}
+}
+
+// Rejects the stalled encode (so encodeThumbnail falls back to the main thread) and tears down the worker so the next encode starts fresh.
+function terminateThumbWorker(): void {
+	const pending = pendingThumb;
+	pendingThumb = null;
+	clearThumbWatchdog();
+	if (pending) pending.reject(new Error("Thumbnail worker stalled; falling back to main-thread encode."));
+	if (thumbnailWorker) {
+		thumbnailWorker.terminate();
+		thumbnailWorker = null;
+	}
+}
+
+// Arms the watchdog for the in-flight encode.
+// On expiry the stalled encode is rejected so the caller falls back to a main-thread encode.
+function armThumbWatchdog(): void {
+	clearThumbWatchdog();
+	thumbWatchdog = setTimeout(() => terminateThumbWorker(), THUMB_WATCHDOG_MS);
+}
 
 function createThumbnailWorker(): Worker | null {
 	try {
@@ -71,6 +105,7 @@ function createThumbnailWorker(): Worker | null {
 			if (typeof data !== "object" || data === null || !pending) return;
 			if (!("id" in data) || data.id !== pending.id) return;
 			pendingThumb = null;
+			clearThumbWatchdog();
 			if ("blob" in data && data.blob instanceof Blob) {
 				pending.resolve(data.blob);
 			} else {
@@ -80,6 +115,7 @@ function createThumbnailWorker(): Worker | null {
 		w.onerror = (event) => {
 			const pending = pendingThumb;
 			pendingThumb = null;
+			clearThumbWatchdog();
 			thumbnailWorker?.terminate();
 			thumbnailWorker = null;
 			if (pending) pending.reject(new Error(event.message || "Thumbnail worker error."));
@@ -90,8 +126,15 @@ function createThumbnailWorker(): Worker | null {
 	}
 }
 
-function encodeViaWorker(imageData: ImageData, maxWidth: number, quality: number): Promise<Blob> {
+export function encodeViaWorker(imageData: ImageData, maxWidth: number, quality: number): Promise<Blob> {
 	return new Promise((resolve, reject) => {
+		// Only one encode is in flight at a time: the worker replies to the latest posted id, so a second
+		// caller must never overwrite the pending slot or the first caller would never resolve. Reject the
+		// concurrent call with a clear error instead of stranding anyone.
+		if (pendingThumb) {
+			reject(new Error("A thumbnail encode is already in flight; concurrent encodes are not supported."));
+			return;
+		}
 		let w = thumbnailWorker;
 		if (!w) {
 			w = createThumbnailWorker();
@@ -104,9 +147,15 @@ function encodeViaWorker(imageData: ImageData, maxWidth: number, quality: number
 		const id = nextThumbId++;
 		pendingThumb = { id, resolve, reject };
 		try {
-			w.postMessage({ id, imageData, maxWidth, quality } satisfies ThumbnailRequest, [imageData.data.buffer]);
+			// No transfer list: the worker gets a structured clone and the main thread keeps a usable copy of the
+			// pixel buffer. If the worker then stalls, the watchdog rejects and encodeThumbnail falls back to the
+			// main-thread encodeThumbnailBlob, which needs imageData.data intact. Transferring the buffer here would
+			// detach it, so the fallback putImageData would throw and the stall->fallback behavior would be defeated.
+			w.postMessage({ id, imageData, maxWidth, quality } satisfies ThumbnailRequest);
+			armThumbWatchdog();
 		} catch (err) {
 			pendingThumb = null;
+			clearThumbWatchdog();
 			reject(err instanceof Error ? err : new Error(String(err)));
 		}
 	});

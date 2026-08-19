@@ -25,6 +25,19 @@ export interface CompressionRun {
 	cancel(reason?: string): void;
 }
 
+/**
+ * Rejection sentinel for a cancelled compression run (Cancel button or the stall watchdog).
+ * The lightbox detects cancellation by `instanceof`, never by comparing a human-readable message,
+ * so a reword of the message can never turn a clean cancel into a spurious "Compression failed" toast.
+ */
+export class CompressionCanceledError extends Error {
+	readonly canceled = true;
+	constructor() {
+		super("Compression canceled.");
+		this.name = "CompressionCanceledError";
+	}
+}
+
 type ProbeOutcome = { plan: CompressionPlan | null; reason: UnsupportedReason | null };
 
 interface Pending {
@@ -119,7 +132,7 @@ function finalize(): void {
 // Used by both the Cancel button and the stall watchdog.
 function terminateWorker(): void {
 	const cur = current;
-	if (cur) cur.onError(new Error("Compression canceled."));
+	if (cur) cur.onError(new CompressionCanceledError());
 	finalize();
 	if (worker) {
 		worker.terminate();

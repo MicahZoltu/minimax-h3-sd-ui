@@ -49,6 +49,16 @@ export function dataUrlToBytes(dataUrl: string): Uint8Array {
 	return bytes;
 }
 
+/**
+ * Derive the MIME type declared by a data URL, falling back to application/octet-stream.
+ * Returns the octet-stream fallback when the data: prefix or an explicit MIME is absent, so every payload gets a usable type.
+ */
+export function mimeOfDataUrl(dataUrl: string): string {
+	const comma = dataUrl.indexOf(",");
+	const header = comma >= 0 ? dataUrl.slice(0, comma) : "";
+	return header.match(/^data:([^;,]+)/)?.[1] ?? "application/octet-stream";
+}
+
 /** Materialize bytes into a Blob (exact-size ArrayBuffer). */
 export function bytesToBlob(bytes: Uint8Array, type: string): Blob {
 	const buffer = new ArrayBuffer(bytes.length);

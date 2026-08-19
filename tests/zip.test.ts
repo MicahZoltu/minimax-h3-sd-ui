@@ -13,14 +13,25 @@ const PNG_BYTES = Uint8Array.from([
 ]);
 
 // The test runner has no DOM; polyfill Image so analyzeZip's decode check passes.
+// naturalWidth/naturalHeight are read at construction so tests can fabricate a declared pixel grid.
+const imgDims: { width: number; height: number } = { width: 1, height: 1 };
 Object.assign(globalThis, {
 	Image: class {
 		onload: (() => void) | null = null;
-		set src(_v: string) {
+		naturalWidth = imgDims.width;
+		naturalHeight = imgDims.height;
+		set src(v: string) {
+			// Mirror a browser's empty-src abort: only a non-empty source triggers a load.
+			if (!v) return;
 			queueMicrotask(() => this.onload?.());
 		}
 	},
 });
+
+function setImageDims(width: number, height: number): void {
+	imgDims.width = width;
+	imgDims.height = height;
+}
 
 describe("classifyName", () => {
 	it("recognizes prompt.txt by suffix, case-insensitively", () => {
@@ -341,5 +352,25 @@ describe("analyzeZip end to end", () => {
 		expect(a.mode).toBe("refs");
 		expect(a.prompt).toBe("large deflate");
 		expect(a.files.length).toBe(1);
+	});
+
+	it("accepts a frame whose decoded pixel grid is within the budget", async () => {
+		setImageDims(4096, 4096);
+		const blob = assembleZip([
+			{ name: "prompt.txt", data: encoder("grid"), method: 0 },
+			{ name: "start.png", data: PNG_BYTES, method: 0 },
+		]);
+		const a = await analyzeZip(blob, "input.zip");
+		expect(a.mode).toBe("start-end");
+	});
+
+	it("rejects a frame whose declared pixel grid exceeds the image pixel cap", async () => {
+		setImageDims(1_000_000, 1_000_000);
+		const blob = assembleZip([
+			{ name: "prompt.txt", data: encoder("huge grid"), method: 0 },
+			{ name: "start.png", data: PNG_BYTES, method: 0 },
+		]);
+		await expect(analyzeZip(blob, "input.zip")).rejects.toThrow(/not a valid image/i);
+		setImageDims(1, 1);
 	});
 });

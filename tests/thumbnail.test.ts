@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from "bun:test";
-import { encodeThumbnailBlob, resolveThumbnailRequest } from "../app/ts/thumbnail.js";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { encodeThumbnail, encodeThumbnailBlob, encodeViaWorker, resolveThumbnailRequest } from "../app/ts/thumbnail.js";
 
 // Bun has no ImageData/OffscreenCanvas/document (they are browser-only DOM globals), so these functions
 // cannot be exercised as-is. Polyfill the smallest surface the thumbnail encode path touches, with an
@@ -152,6 +152,81 @@ describe("thumbnail worker decode+encode path", () => {
 		expect(output.width).toBe(1);
 		expect(output.height).toBe(1);
 	});
+});
+
+describe("thumbnail worker concurrency guard", () => {
+	installGlobals();
+	let worker: ControlledWorker | null = null;
+	let realWorker: unknown;
+
+	// A controllable stand-in for the real Web Worker: it captures posted messages and lets the test
+	// deliver a reply to the pending id manually, so the coordinator's concurrency path is exercised
+	// without spinning up a real worker thread.
+	class ControlledWorker {
+		onmessage: ((event: { data: unknown }) => void) | null = null;
+		onerror: unknown = null;
+		readonly posted: unknown[] = [];
+		constructor() {
+			worker = this;
+		}
+		postMessage(msg: unknown): void {
+			this.posted.push(msg);
+		}
+		terminate(): void {}
+	}
+
+	beforeEach(() => {
+		worker = null;
+		realWorker = (globalThis as { Worker?: unknown }).Worker;
+		(globalThis as { Worker: unknown }).Worker = ControlledWorker as unknown as typeof Worker;
+	});
+
+	afterEach(() => {
+		if (realWorker === undefined) {
+			delete (globalThis as { Worker?: unknown }).Worker;
+		} else {
+			(globalThis as { Worker: unknown }).Worker = realWorker;
+		}
+	});
+
+	it("rejects a second concurrent encode while the first is still in flight", async () => {
+		const frame = new FakeImageData(new Uint8ClampedArray(2 * 2 * 4), 2, 2);
+		const first = encodeViaWorker(frame, 2, 0.7);
+		expect(worker).not.toBeNull();
+		expect(worker?.posted).toHaveLength(1);
+
+		// The concurrent call must reject instead of overwriting the pending slot.
+		const second = encodeViaWorker(frame, 2, 0.7);
+		await expect(second).rejects.toThrow(/already in flight/i);
+
+		// The first call is still owned: delivering its matching worker reply resolves it, so it never hangs.
+		worker?.onmessage?.({ data: { id: 0, blob: new Blob(["thumb"]) } });
+		const blob = await first;
+		expect(blob instanceof Blob).toBe(true);
+		expect(blob.size).toBeGreaterThan(0);
+	});
+
+	it("settles within a bounded time when a worker that never replies is given the encode (stall watchdog)", async () => {
+		// A worker that accepts the message but never posts a terminal reply must not hang the encoder:
+		// the watchdog rejects the stalled encode so encodeThumbnail falls back to the main-thread canvas encode.
+		offscreenCreated.length = 0;
+		const frame = new FakeImageData(new Uint8ClampedArray(2 * 2 * 4), 2, 2);
+		const started = Date.now();
+		const blob = await encodeThumbnail(frame, 2, 0.7);
+		const elapsed = Date.now() - started;
+		expect(blob instanceof Blob).toBe(true);
+		expect(blob.type).toBe("image/jpeg");
+		expect(blob.size).toBeGreaterThan(0);
+		// The worker never replied, so the encode had to out-wait the watchdog before the fallback ran.
+		expect(elapsed).toBeGreaterThanOrEqual(4000);
+		expect(elapsed).toBeLessThan(8000);
+		// The fallback actually produced the blob via a fresh canvas encode.
+		const output = offscreenCreated[offscreenCreated.length - 1];
+		expect(output).toBeDefined();
+		// The main thread kept its own copy of the pixels (no transfer): had the buffer been detached, the
+		// fallback's putImageData would have thrown on a zero-length buffer and the encode would have failed.
+		expect(frame.data.length).toBe(2 * 2 * 4);
+	}, 12000);
 });
 
 describe("main-thread toBlob fallback", () => {

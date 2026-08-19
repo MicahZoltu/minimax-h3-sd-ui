@@ -92,7 +92,6 @@ async function request(path: string, init: RequestInit = {}, timeoutMs = DEFAULT
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
 		const response = await fetch(path, { ...init, signal: controller.signal, headers: { Accept: "application/json", ...(init.headers || {}) } });
-		clearTimeout(timer);
 		let payload: unknown = null;
 		try {
 			payload = await response.json();
@@ -110,6 +109,10 @@ async function request(path: string, init: RequestInit = {}, timeoutMs = DEFAULT
 		// AbortError or network failure.
 		const msg = err instanceof DOMException && err.name === "AbortError" ? "Request timed out." : "Could not reach the server.";
 		throw new ApiError(msg, 0, "network");
+	} finally {
+		// Clear the abort timer on every path (success, HTTP error, and a rejected fetch): a timer left
+		// armed after the request settled would later abort() a controller nobody is listening to.
+		clearTimeout(timer);
 	}
 }
 
@@ -117,16 +120,34 @@ function isCapabilities(value: unknown): value is Capabilities {
 	return value !== null && typeof value === "object";
 }
 
+// The only job statuses the runner understands.
+// Every other string must be treated as an unrecognized status so the poll loop never spins on it.
+const JOB_STATUSES: readonly string[] = ["queued", "generating", "completed", "failed", "cancelled"];
+
 function isJob(value: unknown): value is Job {
 	if (value === null || typeof value !== "object") return false;
 	if (!("id" in value) || !("status" in value)) return false;
-	return typeof value.id === "string" && typeof value.status === "string";
+	if (typeof value.id !== "string" || typeof value.status !== "string") return false;
+	// A status outside the known set would make the poll loop spin forever; reject it at the boundary.
+	if (!JOB_STATUSES.includes(value.status)) return false;
+	// When `started`/`completed` are present they must be finite numbers, or the elapsed-time math downstream
+	// would yield NaN that a persisted HistoryItem could never render. Reject a malformed value outright.
+	if ("started" in value) {
+		const started = value.started;
+		if (started !== null && (typeof started !== "number" || !Number.isFinite(started))) return false;
+	}
+	if ("completed" in value) {
+		const completed = value.completed;
+		if (completed !== null && (typeof completed !== "number" || !Number.isFinite(completed))) return false;
+	}
+	return true;
 }
 
 export function isJobProgress(value: unknown): value is JobProgress {
 	if (value === null || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
-	return typeof v["step"] === "number" && typeof v["steps"] === "number" && typeof v["time"] === "number";
+	// Each numeric field must be a finite number to match isJob's rigor, or an overflowing server value (parsing to Infinity) would later render as "Infinity of N".
+	return Number.isFinite(v["step"]) && Number.isFinite(v["steps"]) && Number.isFinite(v["time"]);
 }
 
 /** True when the server advertises generation progress for the video (vid_gen) mode. */

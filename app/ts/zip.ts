@@ -41,6 +41,9 @@ export const MAX_FILES = 20;
 export const MAX_FRAME_NUMBER = 9;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_ZIP_BYTES = 200 * 1024 * 1024;
+// Cap on a decoded image's pixel grid (naturalWidth * naturalHeight).
+// The byte-based guard bounds size but not the decoded grid, which is what the repeated re-decode/re-encode paths actually materialize, so an 8K / pathological frame must be rejected up front.
+export const MAX_IMAGE_PIXELS = 64_000_000;
 export const MAX_PROMPT_BYTES = 64 * 1024;
 export const MAX_PROMPT_CHARS = 20000;
 
@@ -205,14 +208,22 @@ export function guessImageMime(name: string): string {
 }
 
 /**
- * Validate that a data URL actually decodes as an image in this browser.
- * Used to reject corrupt or non-image frame files up front.
+ * Validate that a data URL actually decodes as an image in this browser within the allowed pixel budget.
+ * Used to reject corrupt, non-image, or pathologically oversized frame files up front.
  */
 export function imageDecodes(dataUrl: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const img = new Image();
-		img.onload = () => resolve(true);
-		img.onerror = () => resolve(false);
+		img.onload = () => {
+			// Drop the source so an oversized decoded frame is not retained in memory.
+			img.src = "";
+			// The byte-based zip-bomb guard bounds size but not the decoded pixel grid, which is what the repeated re-decode/re-encode paths materialize; reject a frame whose grid exceeds the budget.
+			resolve(Number.isFinite(img.naturalWidth) && Number.isFinite(img.naturalHeight) ? img.naturalWidth * img.naturalHeight <= MAX_IMAGE_PIXELS : false);
+		};
+		img.onerror = () => {
+			img.src = "";
+			resolve(false);
+		};
 		img.src = dataUrl;
 	});
 }

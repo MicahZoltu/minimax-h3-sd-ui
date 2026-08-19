@@ -84,7 +84,7 @@ export interface HistoryItem {
 	fps: number;
 	/** Generation time in ms (server completed - started). */
 	elapsedMs: number;
-	/** Epoch ms from the server. */
+	/** Epoch ms derived from the server's seconds-precision `started`. */
 	startedAt: number;
 	completedAt: number;
 	/** Media store key for the small single-frame preview image. */
@@ -92,7 +92,7 @@ export interface HistoryItem {
 	/** Exact byte size of the stored binary thumbnail (the persisted Blob's size). */
 	thumbBytes: number;
 	video: VideoData;
-	/** Whether this item is persisted to localStorage. */
+	/** Whether this item is persisted to IndexedDB. */
 	persisted: boolean;
 	/**
 	 * Whether the completed video has been opened (clicked to show the full video).

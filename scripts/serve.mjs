@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Minimal dependency-free static server for the built ./app/ directory.
-// Used by `pnpm dev`.
+// Used by `bun dev` and `bun serve` (see package.json).
 // Serves GET "/" as app/index.html and other GETs from files inside app/, guarded against path traversal.
 
 import { createServer } from "node:http";

@@ -6,7 +6,7 @@
 // This module never rejects; callers treat it as best-effort.
 
 import { isHistoryItem, isQueueItem, type HistoryBackend, type QueueBackend } from "./history.js";
-import { thumbnailKey, videoKey } from "./media.js";
+import { fileKeyPrefix, thumbnailKey, videoKey } from "./media.js";
 import type { HistoryItem, QueueItem } from "./types.js";
 
 const DB_NAME = "sdcpp.video";
@@ -123,9 +123,9 @@ export function createIdbHistory(): HistoryBackend {
 		setViewed,
 		async remove(id: string): Promise<void> {
 			await runWrite((history, media) => {
-				// Per-file blobs live under ${id}:file:<index>, which this method does not know by count, so
+				// Per-file blobs live under the fileKeyPrefix of the id, which this method does not know by count, so
 				// a bound range cursor deletes every file key for the id in the same transaction as the rest.
-				const range = IDBKeyRange.bound(`${id}:file:`, `${id}:file:\uFFFF`);
+				const range = IDBKeyRange.bound(fileKeyPrefix(id), `${fileKeyPrefix(id)}\uFFFF`);
 				const cursorReq = media.openCursor(range);
 				cursorReq.onsuccess = () => {
 					const cursor = cursorReq.result;

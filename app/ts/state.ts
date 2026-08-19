@@ -4,10 +4,12 @@
 
 import { getCapabilities, supportsVideoProgress, type Capabilities, type JobProgress } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
-import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
 import { createHistoryStore, detectSyncStorage, type QueueBackend, type SyncStorage } from "./history.js";
 import { createIdbHistory, createIdbQueue } from "./idb.js";
+import { videoKey } from "./media.js";
+import { getOrCreate, revokeById } from "./objectUrl.js";
 import { GENERATION_PRESET } from "./request.js";
+import type { HistoryItem, QueueItem, ZipAnalysis } from "./types.js";
 
 const FORM_STORAGE_KEY = "sdcpp.video.formDims";
 
@@ -34,11 +36,11 @@ function readSavedFormDims(storage: SyncStorage | null): SavedFormDims | null {
 		const v: unknown = JSON.parse(raw);
 		if (typeof v !== "object" || v === null) return null;
 		try {
-			const o = v as Record<string, unknown>;
-			const width = o["width"];
-			const height = o["height"];
-			const frames = o["frames"];
-			const steps = o["steps"];
+			if (!("width" in v) || !("height" in v) || !("frames" in v) || !("steps" in v)) return null;
+			const width = v.width;
+			const height = v.height;
+			const frames = v.frames;
+			const steps = v.steps;
 			if (typeof width !== "number" || !Number.isFinite(width) || width <= 0) return null;
 			if (typeof height !== "number" || !Number.isFinite(height) || height <= 0) return null;
 			if (typeof frames !== "number" || !Number.isFinite(frames) || frames <= 0) return null;
@@ -59,6 +61,13 @@ function writeSavedFormDims(storage: SyncStorage | null, dims: SavedFormDims): v
 	} catch {
 		// Best-effort; ignore.
 	}
+}
+
+// Return a shallow copy of a queue item without its transient live `progress`, which is never persisted.
+export function stripProgress(item: QueueItem): QueueItem {
+	const copy = { ...item };
+	delete copy.progress;
+	return copy;
 }
 
 // Keys of QueueItem, used to apply partial patches without untyped casts.
@@ -143,6 +152,10 @@ export interface Store {
 	/** Register a change listener (optionally filtered to one or more domains). Returns an unsubscriber. */
 	subscribe(fn: () => void, domains?: readonly ChangeDomain[]): () => void;
 	emit(domains: ChangeDomain | readonly ChangeDomain[]): void;
+	/**
+	 * Add an item to the FRONT of the queue via unshift, so the in-memory array is always newest-first.
+	 * `nextPending` scans from the end, so the least-recently-added queued item runs next (FIFO).
+	 */
 	pushQueue(item: QueueItem): void;
 	patchQueueItem(id: string, patch: Partial<QueueItem>): void;
 	/**
@@ -203,7 +216,16 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		},
 	};
 	const storage = detectSyncStorage();
-	const history = createHistoryStore(createIdbHistory());
+	// The store "resident" is the single full-size video currently shown (lightbox / hovered row).
+	// Its object URL / Blob are owned by the objectUrl registry and must be revoked when the item leaves memory.
+	let resident: { id: string; blob: Blob; url: string } | null = null;
+	// Monotonic token so a setResident call that had to await loadVideo cannot overwrite a newer call's result.
+	let residentRequestToken = 0;
+	const history = createHistoryStore(createIdbHistory(), (id) => {
+		// When memory-trimming evicts the item that is currently the resident, clear it so its video
+		// Blob + URL are revoked instead of leaking for the whole session.
+		if (resident?.id === id) clearResident();
+	});
 	// The in-memory queue starts empty and is hydrated asynchronously from the IndexedDB backend.
 	// queueReady resolves once that initial load lands, so startup can await it before resuming jobs.
 	let resolveQueueReady: () => void = () => {};
@@ -213,7 +235,10 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 	// Counts in-memory queue mutations; hydration only applies the loaded snapshot when none happened
 	// while the load was in flight, so a fast user action is never clobbered by a stale read.
 	let queueWrites = 0;
-	const queueWritesAtStart = 0;
+	// Fixed baseline against which the "no queue mutation happened before load" shield is checked.
+	// It is a hard-coded literal (0), not a snapshot captured at some later moment: the queue starts
+	// life empty, so the load's precondition is exactly `queueWrites === 0`.
+	const NO_QUEUE_WRITES_BEFORE_LOAD = 0;
 	let hadSavedDims = false;
 	const savedDims = readSavedFormDims(storage);
 	if (savedDims) {
@@ -223,9 +248,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		state.form.steps = savedDims.steps;
 		hadSavedDims = true;
 	}
-	let resident: { id: string; blob: Blob; url: string } | null = null;
-	// Monotonic token so a setResident call that had to await loadVideo cannot overwrite a newer call's result.
-	let residentRequestToken = 0;
 
 	// Revision counters: the UI re-renders a region only when its counter changes, which keeps background polling from rebuilding the form and stealing focus while the user is typing.
 	const revs: Revisions = { form: 0, queue: 0 };
@@ -244,10 +266,19 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 
 	const findIndex = (id: string) => state.queue.findIndex((i) => i.id === id);
 
+	// Persist the queue without each item's transient `progress`, so a refreshed/rehydrated item never
+	// regains a stale live bar and the in-memory items are left untouched.
+	const persistQueue = (): void => {
+		void queueBackend.save(state.queue.map(stripProgress));
+	};
+
 	const clearResident = (): void => {
 		if (!resident) return;
-		URL.revokeObjectURL(resident.url);
+		const id = resident.id;
 		resident = null;
+		// Drop the item's Blob reference and revoke every object URL it owns.
+		revokeById(id);
+		emit("resident");
 	};
 
 	const fetchCapabilities = async (): Promise<void> => {
@@ -264,8 +295,14 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			const f = state.form;
 			if (!f.analysis && !hadSavedDims) {
 				// Width/height come from server defaults when available; frames and steps keep the app defaults (107 / preset steps).
-				state.form.width = v?.width ?? FALLBACK_DIMS.width;
-				state.form.height = v?.height ?? FALLBACK_DIMS.height;
+				// Route the write through setForm so revs.form bumps and a single "form" change is emitted.
+				// Emit only when the default actually changes a dimension, so the periodic probe tick does not
+				// re-render the reconcile (and risk dropping focus) once the defaults are already applied.
+				const width = v?.width ?? FALLBACK_DIMS.width;
+				const height = v?.height ?? FALLBACK_DIMS.height;
+				if (f.width !== width || f.height !== height) {
+					store.setForm({ width, height });
+				}
 			}
 		} catch (err) {
 			state.online = false;
@@ -311,7 +348,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			queueWrites += 1;
 			emit("queue");
 			// Mutate in-memory synchronously (the UI source of truth), persist best-effort in the background.
-			void queueBackend.save(state.queue);
+			persistQueue();
 		},
 		patchQueueItem: (id, patch) => {
 			const item = state.queue.find((i) => i.id === id);
@@ -329,14 +366,20 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 				revs.queue += 1;
 				queueWrites += 1;
 				emit("queue");
-				void queueBackend.save(state.queue);
+				persistQueue();
 			}
 		},
 		setQueueProgress: (id, progress) => {
+			// In-memory only, by design: it neither bumps the queue revision, persists the queue, nor emits.
+			// Progress is transient; the UI repaints it via its own ticker.
+			// The hydration shield below (queueWrites === NO_QUEUE_WRITES_BEFORE_LOAD) only holds because progress
+			// updates never count as a queue write; keep progress off patchQueueItem or the shield is defeated.
 			const item = state.queue.find((i) => i.id === id);
 			if (!item) return;
-			// Skip work when the value is unchanged so emit() fires only on an actual update.
-			if (item.progress && item.progress.step === progress.step && item.progress.steps === progress.steps) return;
+			// The early-return exists only to skip the no-op of overwriting an identical value.
+			// `time` is part of the identity: the server reports a fresh per-step duration continuously within a call,
+			// so a newer time at the same step must count as an update or the s/step readout freezes at the last boundary.
+			if (item.progress && item.progress.step === progress.step && item.progress.steps === progress.steps && item.progress.time === progress.time) return;
 			item.progress = progress;
 		},
 		removeQueue: (id) => {
@@ -346,7 +389,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			revs.queue += 1;
 			queueWrites += 1;
 			emit("queue");
-			void queueBackend.save(state.queue);
+			persistQueue();
 		},
 		moveQueue: (from, to) => {
 			const q = state.queue;
@@ -356,7 +399,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			q.splice(to, 0, item);
 			revs.queue += 1;
 			queueWrites += 1;
-			void queueBackend.save(state.queue);
+			persistQueue();
 			emit("queue");
 		},
 		addHistory: (item, media) => {
@@ -389,8 +432,8 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			const token = ++residentRequestToken;
 			const blob = preloaded ?? (await history.loadVideo(id));
 			if (!blob || token !== residentRequestToken) return;
-			if (resident) URL.revokeObjectURL(resident.url);
-			resident = { id, blob, url: URL.createObjectURL(blob) };
+			if (resident) revokeById(resident.id);
+			resident = { id, blob, url: getOrCreate(videoKey(id), blob) };
 			emit("resident");
 		},
 		residentId: () => (resident ? resident.id : null),
@@ -425,7 +468,10 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		// Only surface the persisted snapshot if nothing was mutated while it was loading, so an early
 		// user action is never clobbered by a stale read (load is typically faster than user input).
 		// A throwing backend resolves nothing: the session stays in-memory only, exactly like an unavailable backend.
-		if (loaded !== null && queueWrites === queueWritesAtStart) {
+		// This guard only holds because setQueueProgress deliberately does NOT increment queueWrites: progress
+		// polled mid-hydration must not look like a user mutation or it would discard the loaded snapshot.
+		// Routing progress through patchQueueItem would silently defeat this shield.
+		if (loaded !== null && queueWrites === NO_QUEUE_WRITES_BEFORE_LOAD) {
 			state.queue = loaded;
 			revs.queue += 1;
 			emit("queue");

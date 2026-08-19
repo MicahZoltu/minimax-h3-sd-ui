@@ -6,20 +6,24 @@
 
 import { ApiError, getJob, isJobProgress, submitVideoJob } from "./api.js";
 import type { Job } from "./api.js";
-import { dataUrlToBlob, fileKey, thumbnailKey } from "./media.js";
-import { buildVidGenRequest, mimeForFormat, GENERATION_PRESET } from "./request.js";
+import { buildCompletion } from "./completions.js";
+import { buildVidGenRequest, mimeForFormat } from "./request.js";
 import type { Store } from "./state.js";
 import { encodeThumbnail } from "./thumbnail.js";
-import type { HistoryItem, PersistedFile, QueueItem } from "./types.js";
-import { base64ToBytes, bytesToBlob, sleep, uid } from "./utils.js";
+import type { QueueItem } from "./types.js";
+import { base64ToBytes, bytesToBlob, sleep } from "./utils.js";
 
 export const POLL_MS = 1500;
+const CAPTURE_TIMEOUT_MS = 10000;
 const SUBMIT_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const MAX_SUBMIT_RETRIES = SUBMIT_RETRY_DELAYS_MS.length;
 
-function isRetriable(err: unknown): boolean {
+export function isRetriable(err: unknown): boolean {
 	if (!(err instanceof ApiError)) return false;
-	// Network issues (status 0) and transient server errors can be retried.
+	// A "service" code marks a malformed server response / protocol problem, which both the submit
+	// and poll paths agree is fatal: a retry would re-POST and can spawn a duplicate server job.
+	if (err.code === "service") return false;
+	// Genuine transient issues (status 0 network/timeout, 429, 500, 503) can be retried.
 	return err.status === 0 || err.status === 429 || err.status === 500 || err.status === 503;
 }
 
@@ -45,8 +49,12 @@ export function resumeActiveJobs(store: Store): void {
 	}
 }
 
-function nextPending(store: Store): QueueItem | undefined {
-	// The array is newest-first (pushQueue unshifts), so the oldest queued item sits last and runs next (FIFO).
+/**
+ * Return the next item to run: the LAST (oldest) `queued` element of the FIFO queue.
+ * The in-memory array is newest-first (pushQueue unshifts new items to the front), so the item that has
+ * waited longest sits at the end, and scanning from the tail yields true first-in-first-out order.
+ */
+export function nextPending(store: Store): QueueItem | undefined {
 	for (let i = store.state.queue.length - 1; i >= 0; i--) {
 		const item = store.state.queue[i];
 		if (item && item.status === "queued") return item;
@@ -73,11 +81,11 @@ async function runItem(store: Store, item: QueueItem): Promise<void> {
 		store.patchQueueItem(item.id, { status: "failed", error: store.state.progressError });
 		return;
 	}
-	const body = buildVidGenRequest(item);
 	store.patchQueueItem(item.id, { status: "submitting", startedAt: null, error: null });
 
 	let job: Job;
 	try {
+		const body = buildVidGenRequest(item);
 		job = await submitWithRetry(body);
 	} catch (err) {
 		store.patchQueueItem(item.id, { status: "failed", error: `Could not start the job: ${messageOf(err)}` });
@@ -123,6 +131,11 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 				store.patchQueueItem(itemId, { status: "failed", error: lostJobMessage });
 				return;
 			}
+			// An unrecognized job payload (unknown status or malformed shape) is not transient: re-polling will not fix it, so fail the item now.
+			if (err instanceof ApiError && err.code === "service") {
+				store.patchQueueItem(itemId, { status: "failed", error: "The server returned an unrecognized job response." });
+				return;
+			}
 			// Transient network/server issue: the job may still be running, so keep polling, but bound how long we wait before giving up.
 			consecutiveErrors += 1;
 			if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
@@ -151,7 +164,13 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 			store.patchQueueItem(itemId, { status: "cancelled", error: job.error?.message || "Job was cancelled." });
 			return;
 		}
-		// Still queued/generating: loop again.
+		if (job.status === "queued" || job.status === "generating") {
+			// Still queued/generating: loop again.
+			continue;
+		}
+		// Any other status is an unexpected terminal condition: fail the item so the loop cannot spin forever on a status we do not handle.
+		store.patchQueueItem(itemId, { status: "failed", error: `The server reported an unrecognized job status: ${job.status}` });
+		return;
 	}
 }
 
@@ -159,69 +178,32 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 	const item = store.state.queue.find((i) => i.id === itemId);
 	const result = job.result;
 	const b64 = result?.b64_json || (result?.images && result.images[0]?.b64_json);
-	if (!item || !b64) {
+	if (!item || !result || typeof b64 !== "string") {
+		// A missing payload or a truthy non-string `b64_json` from the server is not decodable, so it is no usable video data.
 		store.patchQueueItem(itemId, { status: "failed", error: "Server returned no video data." });
 		return;
 	}
 
 	const format = safeFormat(result.output_format);
 	const mime = mimeForFormat(format);
-	const videoBlob = bytesToBlob(base64ToBytes(b64), mime);
-	let thumbBlob: Blob;
 	try {
-		thumbBlob = await captureVideoThumbnail(videoBlob, mime);
-	} catch {
-		// Thumbnail decode is best-effort; a missing preview must not fail the generation.
-		thumbBlob = new Blob([], { type: "image/jpeg" });
-	}
-	const frameCount = result.frame_count !== undefined && Number.isFinite(result.frame_count) ? result.frame_count : item.jobFrames;
-	const fps = result.fps !== undefined && Number.isFinite(result.fps) ? result.fps : GENERATION_PRESET.fps;
-	const startedSec = job.started ?? job.completed ?? 0;
-	const completedSec = job.completed ?? startedSec;
-	const elapsedMs = Math.max(0, completedSec - startedSec) * 1000;
-
-	const historyId = uid("h_");
-	// Convert the payload-bearing queue files to Blobs exactly once, so both the record's byte sizes and
-	// the persisted media match the bytes the thumbnail and store will resolve by key.
-	// A malformed dataUrl must not strand the completed item: a failed conversion records bytes 0 (and an
-	// empty Blob keeps index alignment) so the item still progresses out of the queue.
-	const fileBlobs: (Blob | null)[] = item.files.map((f) => {
+		const videoBlob = bytesToBlob(base64ToBytes(b64), mime);
+		let thumbBlob: Blob;
 		try {
-			return dataUrlToBlob(f.dataUrl);
+			thumbBlob = await captureVideoThumbnail(videoBlob, mime);
 		} catch {
-			return null;
+			// Thumbnail decode is best-effort; a missing preview must not fail the generation.
+			thumbBlob = new Blob([], { type: "image/jpeg" });
 		}
-	});
-	const files: PersistedFile[] = item.files.map((f, index) => {
-		const blob = fileBlobs[index];
-		return { name: f.name, key: fileKey(historyId, index), bytes: blob ? blob.size : 0 };
-	});
-	const mediaFiles: Blob[] = fileBlobs.map((blob) => blob ?? new Blob([], { type: "application/octet-stream" }));
+		const { historyItem, videoBlob: recordedVideo, thumbBlob: recordedThumb, fileBlobs } = buildCompletion(item, job, { videoBlob, thumbBlob, format, mime });
 
-	const historyItem: HistoryItem = {
-		id: historyId,
-		createdAt: Date.now(),
-		prompt: item.prompt,
-		zipName: item.zipName,
-		mode: item.mode,
-		files,
-		width: item.width,
-		height: item.height,
-		frameCount,
-		fps,
-		elapsedMs,
-		startedAt: startedSec * 1000,
-		completedAt: completedSec * 1000,
-		thumbnailKey: thumbnailKey(historyId),
-		thumbBytes: thumbBlob.size,
-		video: { mime, format, byteSize: videoBlob.size },
-		persisted: false,
-		viewed: false,
-	};
-
-	store.addHistory(historyItem, { video: videoBlob, thumbnail: thumbBlob, files: mediaFiles });
-	store.removeQueue(itemId);
-	void store.setResident(historyItem.id, videoBlob);
+		store.addHistory(historyItem, { video: recordedVideo, thumbnail: recordedThumb, files: fileBlobs });
+		store.removeQueue(itemId);
+		void store.setResident(historyItem.id, recordedVideo);
+	} catch (err) {
+		// A malformed server payload (non-decodable base64, an atob DOMException, a build throw) must degrade this one item to failed and let the queue advance, never freeze the whole queue.
+		store.patchQueueItem(itemId, { status: "failed", error: `Could not decode the server's video payload: ${messageOf(err)}` });
+	}
 }
 
 async function captureVideoThumbnail(videoBlob: Blob, mime: string): Promise<Blob> {
@@ -236,7 +218,7 @@ async function captureVideoThumbnail(videoBlob: Blob, mime: string): Promise<Blo
 		video.muted = true;
 		video.playsInline = true;
 		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error("thumbnail timeout")), 10000);
+			const timer = setTimeout(() => reject(new Error("thumbnail timeout")), CAPTURE_TIMEOUT_MS);
 			video.addEventListener("loadeddata", () => { clearTimeout(timer); resolve(); }, { once: true });
 			video.addEventListener("error", () => { clearTimeout(timer); reject(new Error("thumbnail decode error")); }, { once: true });
 		});
@@ -244,7 +226,10 @@ async function captureVideoThumbnail(videoBlob: Blob, mime: string): Promise<Blo
 		video.currentTime = 0;
 		await new Promise<void>((resolve) => {
 			if (video.readyState >= 2 || video.currentTime !== 0) { resolve(); return; }
-			video.addEventListener("seeked", () => resolve(), { once: true });
+			// Some browsers never fire `seeked` for a seek to the current position (currentTime = 0 on a fresh source).
+			// Resolve on timeout so the capture steps into the post-seek draw instead of hanging the completion path forever.
+			const timer = setTimeout(() => resolve(), CAPTURE_TIMEOUT_MS);
+			video.addEventListener("seeked", () => { clearTimeout(timer); resolve(); }, { once: true });
 		});
 		const width = video.videoWidth;
 		const height = video.videoHeight;
