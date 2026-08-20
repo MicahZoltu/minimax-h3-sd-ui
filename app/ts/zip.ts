@@ -216,12 +216,14 @@ export function imageDecodes(dataUrl: string): Promise<boolean> {
 		const img = new Image();
 		img.onload = () => {
 			// Drop the source so an oversized decoded frame is not retained in memory.
-			img.src = "";
+			// Never assign src = "" here: per the HTML spec an empty-but-present src fires an error event on the img, which in Firefox re-enters this handler and spins an infinite error-event loop that starves the tab's favicon updates.
+			img.removeAttribute("src");
 			// The byte-based zip-bomb guard bounds size but not the decoded pixel grid, which is what the repeated re-decode/re-encode paths materialize; reject a frame whose grid exceeds the budget.
 			resolve(Number.isFinite(img.naturalWidth) && Number.isFinite(img.naturalHeight) ? img.naturalWidth * img.naturalHeight <= MAX_IMAGE_PIXELS : false);
 		};
 		img.onerror = () => {
-			img.src = "";
+			// See the note in onload: never assign src = "" here either.
+			img.removeAttribute("src");
 			resolve(false);
 		};
 		img.src = dataUrl;

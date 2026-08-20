@@ -25,6 +25,7 @@ Object.assign(globalThis, {
 			if (!v) return;
 			queueMicrotask(() => this.onload?.());
 		}
+		removeAttribute(_name: string): void {}
 	},
 });
 
