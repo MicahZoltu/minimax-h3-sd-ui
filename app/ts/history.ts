@@ -7,8 +7,8 @@
 //
 // This module also owns the queue persistence backend contract and the storage-usage estimator.
 
-import { fileKey, fileKeyPrefix, thumbnailKey, videoKey } from "./media.js";
-import type { HistoryItem, QueueItem, QueueStatus, ZipMode } from "./types.js";
+import { fileKey, refAudioKey, refVideoAudioKey, refVideoSourceKey, refVideoThumbKey, thumbnailKey, videoKey } from "./media.js";
+import type { HistoryItem, QueueItem, QueueStatus, RefAudioFile, RefVideoFile, ZipMode } from "./types.js";
 
 export interface SyncStorage {
 	getItem(key: string): string | null;
@@ -36,6 +36,39 @@ function isFiniteNumber(n: unknown): n is number {
 	return typeof n === "number" && Number.isFinite(n);
 }
 
+function isRefVideoFile(value: unknown): value is RefVideoFile {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("name" in value) || !("fps" in value) || !("frames" in value) || !("audio" in value) || !("sourceDataUrl" in value)) return false;
+	if (typeof value.name !== "string") return false;
+	if (!isFiniteNumber(value.fps) || value.fps <= 0) return false;
+	if (!Array.isArray(value.frames) || value.frames.some((f) => typeof f !== "string")) return false;
+	if (value.audio !== null && typeof value.audio !== "string") return false;
+	if (typeof value.sourceDataUrl !== "string") return false;
+	return true;
+}
+
+function isRefAudioFile(value: unknown): value is RefAudioFile {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("name" in value) || !("dataUrl" in value) || !("sourceDataUrl" in value)) return false;
+	return typeof value.name === "string" && typeof value.dataUrl === "string" && typeof value.sourceDataUrl === "string";
+}
+
+function isPersistedRefVideo(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("name" in value) || !("thumbKey" in value) || !("thumbBytes" in value) || !("audioKey" in value) || !("audioBytes" in value) || !("sourceKey" in value) || !("sourceBytes" in value)) return false;
+	if (typeof value.name !== "string" || typeof value.thumbKey !== "string" || !isFiniteNumber(value.thumbBytes)) return false;
+	if (value.audioKey !== null && typeof value.audioKey !== "string") return false;
+	if (!isFiniteNumber(value.audioBytes)) return false;
+	return typeof value.sourceKey === "string" && isFiniteNumber(value.sourceBytes);
+}
+
+function isPersistedRefAudio(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	return ("name" in value && typeof value.name === "string") && ("key" in value && typeof value.key === "string") && ("bytes" in value && isFiniteNumber(value.bytes));
+}
+
+// Reference-video/audio arrays predate older persisted records; absent fields are treated as empty rather than rejected.
+// When present they are validated strictly so a malformed ref cannot ride along into a request.
 export function isQueueItem(value: unknown): value is QueueItem {
 	if (typeof value !== "object" || value === null) return false;
 	if (!("id" in value) || !("status" in value) || !("prompt" in value)) return false;
@@ -51,6 +84,11 @@ export function isQueueItem(value: unknown): value is QueueItem {
 	if (!isFiniteNumber(value.steps) || value.steps <= 0) return false;
 	if (!("files" in value) || !Array.isArray(value.files)) return false;
 	if (value.files.some((f) => typeof f !== "object" || f === null || !("name" in f) || !("dataUrl" in f) || typeof f.name !== "string" || typeof f.dataUrl !== "string")) return false;
+	const refs = value as Record<string, unknown>;
+	if (refs["videos"] !== undefined && refs["videos"] !== null && !Array.isArray(refs["videos"])) return false;
+	if (Array.isArray(refs["videos"]) && refs["videos"].some((v: unknown) => !isRefVideoFile(v))) return false;
+	if (refs["audios"] !== undefined && refs["audios"] !== null && !Array.isArray(refs["audios"])) return false;
+	if (Array.isArray(refs["audios"]) && refs["audios"].some((a: unknown) => !isRefAudioFile(a))) return false;
 	if (!("serverId" in value) || (value.serverId !== null && typeof value.serverId !== "string")) return false;
 	if (!("startedAt" in value) || (value.startedAt !== null && !isFiniteNumber(value.startedAt))) return false;
 	if (!("error" in value) || (value.error !== null && typeof value.error !== "string")) return false;
@@ -74,7 +112,29 @@ export function isHistoryItem(value: unknown): value is HistoryItem {
 	if (!("zipName" in value) || (value.zipName !== null && typeof value.zipName !== "string")) return false;
 	if (!("files" in value) || !Array.isArray(value.files)) return false;
 	if (value.files.some((f) => typeof f !== "object" || f === null || !("name" in f) || !("key" in f) || !("bytes" in f) || typeof f.name !== "string" || typeof f.key !== "string" || typeof f.bytes !== "number")) return false;
+	// Reference-video/audio lists predate older records; absent fields are treated as empty rather than rejected.
+	if ("videos" in value && value.videos !== null) {
+		if (!Array.isArray(value.videos) || value.videos.some((v) => !isPersistedRefVideo(v))) return false;
+	}
+	if ("audios" in value && value.audios !== null) {
+		if (!Array.isArray(value.audios) || value.audios.some((a) => !isPersistedRefAudio(a))) return false;
+	}
 	return true;
+}
+
+/** The Blobs to persist under a completed item's media-store keys. */
+export interface HistoryMedia {
+	video: Blob;
+	thumbnail: Blob;
+	files: Blob[];
+	/** First-frame preview Blob per reference video. */
+	videoThumbs: Blob[];
+	/** WAV soundtrack Blob per reference video (null when the video has no soundtrack). */
+	videoAudios: (Blob | null)[];
+	/** Original container Bytes per reference video. */
+	videoSources: Blob[];
+	/** Original file Bytes per reference audio clip. */
+	audioSources: Blob[];
 }
 
 export interface HistoryBackend {
@@ -83,7 +143,7 @@ export interface HistoryBackend {
 	/** Return every persisted item, or an empty array on any failure. */
 	loadAll(): Promise<HistoryItem[]>;
 	save(item: HistoryItem, videoBlob: Blob): Promise<void>;
-	/** Persist a single media Blob (thumbnail or input file) under its media-store key. */
+	/** Persist a single media Blob (thumbnail, input file, or reference-video/audio payload) under its media-store key. */
 	storeMedia(key: string, blob: Blob): Promise<void>;
 	/** Update only an item's `viewed` field on the history object store key, not the whole record. */
 	setViewed(id: string, viewed: boolean): Promise<void>;
@@ -94,7 +154,7 @@ export interface HistoryBackend {
 
 export interface HistoryStore {
 	items(): HistoryItem[];
-	add(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void;
+	add(item: HistoryItem, media: HistoryMedia): void;
 	/** Mark an item viewed (persist best-effort); a no-op when it is already viewed. */
 	markViewed(id: string): void;
 	remove(id: string): void;
@@ -134,19 +194,19 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 
 	const evictItemMedia = (id: string): void => {
 		mediaCache.delete(videoKey(id));
-		mediaCache.delete(thumbnailKey(id));
-		// Drop every cached file key by its shared prefix so legacy non-contiguous keys are evicted as well.
+		// Drop every cached media key belonging to this item: the thumbnail, each persisted file key (legacy
+		// non-contiguous keys included), and every reference-video/audio key share the `<id>:` prefix.
 		for (const key of mediaCache.keys()) {
-			if (key.startsWith(fileKeyPrefix(id))) mediaCache.delete(key);
+			if (key.startsWith(`${id}:`)) mediaCache.delete(key);
 		}
 	};
 
 	let loadPromise: Promise<void> | null = null;
 
-	async function persistItem(item: HistoryItem, videoBlob: Blob, thumbnailBlob: Blob, fileBlobs: Blob[]): Promise<void> {
+	async function persistItem(item: HistoryItem, media: HistoryMedia): Promise<void> {
 		if (!backend) return;
 		try {
-			await backend.save(item, videoBlob);
+			await backend.save(item, media.video);
 			item.persisted = true;
 		} catch {
 			// Best-effort: a failed write leaves the item session-only rather than missing from the running list.
@@ -154,10 +214,22 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 			return;
 		}
 		try {
-			await backend.storeMedia(thumbnailKey(item.id), thumbnailBlob);
-			for (let i = 0; i < fileBlobs.length; i++) {
-				const blob = fileBlobs[i];
+			await backend.storeMedia(thumbnailKey(item.id), media.thumbnail);
+			for (let i = 0; i < media.files.length; i++) {
+				const blob = media.files[i];
 				if (blob) await backend.storeMedia(fileKey(item.id, i), blob);
+			}
+			for (let i = 0; i < media.videoThumbs.length; i++) {
+				const thumb = media.videoThumbs[i];
+				const audio = media.videoAudios[i];
+				const source = media.videoSources[i];
+				if (thumb) await backend.storeMedia(refVideoThumbKey(item.id, i), thumb);
+				if (audio) await backend.storeMedia(refVideoAudioKey(item.id, i), audio);
+				if (source) await backend.storeMedia(refVideoSourceKey(item.id, i), source);
+			}
+			for (let i = 0; i < media.audioSources.length; i++) {
+				const source = media.audioSources[i];
+				if (source) await backend.storeMedia(refAudioKey(item.id, i), source);
 			}
 		} catch {
 			// A failed media write is also best-effort; the record still persists and media degrades to a placeholder.
@@ -204,7 +276,7 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 			}
 			return loadPromise;
 		},
-		add(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void {
+		add(item: HistoryItem, media: HistoryMedia): void {
 			items.push(item);
 			item.persisted = false;
 			cacheMedia(videoKey(item.id), media.video);
@@ -213,7 +285,19 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 				const blob = media.files[i];
 				if (blob) cacheMedia(fileKey(item.id, i), blob);
 			}
-			void persistItem(item, media.video, media.thumbnail, media.files);
+			for (let i = 0; i < media.videoThumbs.length; i++) {
+				const thumb = media.videoThumbs[i];
+				const audio = media.videoAudios[i];
+				const source = media.videoSources[i];
+				if (thumb) cacheMedia(refVideoThumbKey(item.id, i), thumb);
+				if (audio) cacheMedia(refVideoAudioKey(item.id, i), audio);
+				if (source) cacheMedia(refVideoSourceKey(item.id, i), source);
+			}
+			for (let i = 0; i < media.audioSources.length; i++) {
+				const source = media.audioSources[i];
+				if (source) cacheMedia(refAudioKey(item.id, i), source);
+			}
+			void persistItem(item, media);
 			trimMemory();
 		},
 		loadVideo(id: string): Promise<Blob | null> {

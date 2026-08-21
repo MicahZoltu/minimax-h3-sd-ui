@@ -137,7 +137,15 @@ async function handleConvert(request: { blob: Blob; plan: CompressionPlan; quali
 scope.onmessage = (event) => {
 	const request = event.data;
 	if (request.type === "probe") {
-		void handleProbe(request.blob);
+		void (async () => {
+			try {
+				await handleProbe(request.blob);
+			} catch {
+				// A throwing probe would otherwise never post a reply, stranding the lightbox until the watchdog.
+				// Surface it as an explicit (unviable) result so the UI fails fast and reports the reason.
+				scope.postMessage({ type: "probe-result", plan: null, reason: "probe-error" });
+			}
+		})();
 	} else if (request.type === "convert") {
 		void (async () => {
 			try {

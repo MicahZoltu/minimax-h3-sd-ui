@@ -14,7 +14,7 @@ export interface CompressionPlan {
 	mime: string;
 }
 
-export type UnsupportedReason = "no-webcodecs" | "no-encodable-codec";
+export type UnsupportedReason = "no-webcodecs" | "no-encodable-codec" | "probe-error";
 
 export type WorkerRequest =
 	| { type: "probe"; blob: Blob }

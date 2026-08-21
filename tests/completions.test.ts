@@ -15,6 +15,8 @@ function queueItem(over: Partial<QueueItem> = {}): QueueItem {
 		zipName: "cat.zip",
 		mode: "refs",
 		files: [{ name: "f1.png", dataUrl: PNG }],
+		videos: [],
+		audios: [],
 		width: 512,
 		height: 512,
 		jobFrames: 49,

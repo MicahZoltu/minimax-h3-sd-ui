@@ -62,6 +62,8 @@ function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 		mode: "prompt",
 		// files is filled by the caller; the base shape must satisfy isHistoryItem.
 		files: [],
+		videos: [],
+		audios: [],
 		width: 512,
 		height: 512,
 		frameCount: 33,
@@ -93,7 +95,7 @@ describe("history media externalization round trip", () => {
 		const fileA = new Blob(["Aa"], { type: "image/png" });
 		const fileB = new Blob(["Bb"], { type: "image/png" });
 		const thumb = new Blob(["thumb"], { type: "image/png" });
-		store.add(item, { video: new Blob(["v"]), thumbnail: thumb, files: [fileA, fileB] });
+		store.add(item, { video: new Blob(["v"]), thumbnail: thumb, files: [fileA, fileB], videoThumbs: [], videoAudios: [], videoSources: [], audioSources: [] });
 		await flush();
 
 		// The record's files use the derived keys.

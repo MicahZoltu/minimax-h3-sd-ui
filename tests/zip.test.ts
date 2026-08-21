@@ -127,6 +127,68 @@ describe("classifyNames validation", () => {
 	});
 });
 
+describe("reference video/audio classification", () => {
+	it("classifies numbered container/video and audio files by extension", () => {
+		expect({ kind: classifyName("clip1.mp4").kind, frame: classifyName("clip1.mp4").frame }).toEqual({ kind: "video", frame: 1 });
+		expect({ kind: classifyName("mov2.mov").kind, frame: classifyName("mov2.mov").frame }).toEqual({ kind: "video", frame: 2 });
+		expect({ kind: classifyName("sound3.wav").kind, frame: classifyName("sound3.wav").frame }).toEqual({ kind: "audio", frame: 3 });
+		expect({ kind: classifyName("song1.mp3").kind, frame: classifyName("song1.mp3").frame }).toEqual({ kind: "audio", frame: 1 });
+		expect(classifyName("notes.txt").kind).toBe("other");
+		expect(classifyName("clip1.avi").kind).toBe("other");
+	});
+
+	it("numbers each file type independently so 1.png / 1.mp4 / 1.wav coexist", () => {
+		const r = classifyNames(["prompt.txt", "1.png", "1.mp4", "1.wav"]);
+		expect(r.ok).toBe(true);
+		expect(r.mode).toBe("refs");
+		expect(r.orderedNames).toEqual(["1.png"]);
+		expect(r.videoNames).toEqual(["1.mp4"]);
+		expect(r.audioNames).toEqual(["1.wav"]);
+	});
+
+	it("accepts a video-only reference set", () => {
+		const r = classifyNames(["prompt.txt", "v1.mp4", "v2.mp4"]);
+		expect(r.ok).toBe(true);
+		expect(r.mode).toBe("refs");
+		expect(r.orderedNames).toEqual([]);
+		expect(r.videoNames).toEqual(["v1.mp4", "v2.mp4"]);
+		expect(r.audioNames).toEqual([]);
+	});
+
+	it("enforces per-type sequential numbering for videos and audio", () => {
+		expect(classifyNames(["prompt.txt", "v1.mp4", "v3.mp4"]).ok).toBe(false);
+		expect(classifyNames(["prompt.txt", "v2.mp4", "v3.mp4"]).ok).toBe(false);
+		expect(classifyNames(["prompt.txt", "a1.mp3", "a2.mp3"]).ok).toBe(true);
+		expect(classifyNames(["prompt.txt", "a1.mp3", "a3.mp3"]).ok).toBe(false);
+	});
+
+	it("caps videos and audio at 3 each", () => {
+		const manyVideos = classifyNames(["prompt.txt", "v1.mp4", "v2.mp4", "v3.mp4", "v4.mp4"]);
+		expect(manyVideos.ok).toBe(false);
+		expect(manyVideos.errors.join(" ")).toMatch(/Up to 3/);
+		const manyAudio = classifyNames(["prompt.txt", "a1.wav", "a2.wav", "a3.wav", "a4.wav"]);
+		expect(manyAudio.errors.join(" ")).toMatch(/Up to 3/);
+	});
+
+	it("caps the total reference count at 12 across all types", () => {
+		const names = [
+			"prompt.txt",
+			...Array.from({ length: 9 }, (_, i) => `f${i + 1}.png`),
+			...Array.from({ length: 3 }, (_, i) => `v${i + 1}.mp4`),
+			...Array.from({ length: 3 }, (_, i) => `a${i + 1}.wav`),
+		];
+		const r = classifyNames(names);
+		expect(r.ok).toBe(false);
+		expect(r.errors.join(" ")).toMatch(/Too many reference files/);
+	});
+
+	it("rejects mixing start/end files with any numbered reference, including video/audio", () => {
+		const r = classifyNames(["prompt.txt", "start.png", "v1.mp4"]);
+		expect(r.ok).toBe(false);
+		expect(r.errors.join(" ")).toMatch(/mixes/i);
+	});
+});
+
 describe("analyzeZip end to end", () => {
 	function buildStoredZip(files: Record<string, Uint8Array | string>): Blob {
 		const source = Object.entries(files)

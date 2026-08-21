@@ -31,6 +31,21 @@ export function buildForm(store: Store): HTMLElement {
 								)),
 						])
 					  : null,
+				  f.analysis.videos.length > 0
+					  ? h("div", { class: "analysis-row" }, [
+							h("span", { class: "key" }, "videos"),
+							h("div", { class: "thumbs" },
+								f.analysis.videos.map((video) =>
+									h("img", { class: "thumb", src: video.frames[0] ?? "", alt: video.name, title: `Play ${video.name} (${video.frames.length} frames at ${video.fps}fps)`, decoding: "async", "data-action": "view-ref-video", "data-name": video.name }),
+								)),
+						])
+					  : null,
+				  f.analysis.audios.length > 0
+					  ? h("div", { class: "analysis-row" }, [
+							h("span", { class: "key" }, `audio (${f.analysis.audios.length})`),
+							h("div", { class: "ref-audios" }, f.analysis.audios.map((audio) => h("button", { class: "badge", type: "button", title: `Play ${audio.name}`, "data-action": "view-ref-audio", "data-name": audio.name }, audio.name))),
+						])
+					  : null,
 			  ]),
 		  ]
 		: [];
@@ -53,6 +68,8 @@ export function buildForm(store: Store): HTMLElement {
 			dimField("Steps", "steps", f.steps, "steps"),
 		]),
 		h("div", { class: "actions" }, [
+			h("button", { class: "btn secondary", type: "button", "data-action": "open-codecs" }, "Codec support"),
+			h("div", { class: "actions-spacer" }),
 			h("button", {
 				class: "btn primary",
 				type: "button",

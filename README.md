@@ -18,8 +18,9 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
 
 ## Features
 
-- Upload a `.zip` containing a `prompt.txt` plus either nothing, optional `start`/`end` image files, or numbered reference frames (`*1 … *N`, N ≤ 9).
+- Upload a `.zip` containing a `prompt.txt` plus either nothing, optional `start`/`end` image files, or numbered reference files (images, and reference **video** and **audio**).
   Files are matched by suffix: the prompt is any file whose name ends with `prompt.txt`, and start/end are names like `start`/`end` or ending in `...start.`/`...end.` (any extension).
+  Numbered references are typed by extension and numbered **per type** (each starts at 1): image frames (`*1.png` … ≤ 9), video files (`*1.mp4` … ≤ 3, decoded client-side to an ordered frame list + real fps + optional WAV soundtrack), and audio clips (`*1.wav` … ≤ 3, transcoded to WAV), with at most 12 reference files total.
   All files must sit at the top level (no subfolders).
 - Set width, height, and frame count per upload.
 - A browser-side queue that runs one job at a time and auto-advances.
@@ -79,8 +80,9 @@ Note the page may call the API cross-origin, so the serving host must send `Acce
 The completed `vid_gen` result does not echo width/height, so history stores the request width/height as the "final used" values, and the server-reported `frame_count` (which the server normalizes to the largest `4n+1 <= requested`) as the final frame count.
 Elapsed time is `completed - started` from the job.
 
-**Zip input spec.** A valid zip contains exactly one prompt file plus exactly one of: `prompt.txt` only (`prompt` mode), `start`/`end` image files (`start-end` mode), or numbered image frames `*1, *2, …, *N`, N ≤ 9 (`refs` mode).
-Rejected on upload (before any content is read): missing or duplicate prompt, unexpected/extraneous files, files in subfolders (top-level only), mixing `start`/`end` with numbered frames, frames not a contiguous gap-free sequence starting at 1 (including `f1.png` vs `01.png`), more than 9 frames, a non-decodable image, empty/oversized prompt, oversized files, or a non-zip payload.
+**Zip input spec.** A valid zip contains exactly one prompt file plus exactly one of: `prompt.txt` only (`prompt` mode), `start`/`end` image files (`start-end` mode), or numbered reference files (`refs` mode).
+References are typed by extension and numbered independently per type, each a contiguous gap-free sequence from 1: image frames (`*1.png`, ≤ 9), reference video files (`*1.mp4`/`*1.webm`/…, ≤ 3), and reference audio clips (`*1.wav`/`*1.mp3`/…, ≤ 3), with ≤ 12 reference files across all types.
+Rejected on upload (before any content is read): missing or duplicate prompt, unexpected/extraneous files, files in subfolders (top-level only), mixing `start`/`end` with any numbered reference, a numbered group that is not a contiguous gap-free sequence starting at 1 (including `f1.png` vs `01.png`), exceeding a per-type or the total reference cap, a non-decodable image/video/audio, empty/oversized prompt, oversized files, or a non-zip payload.
 
 File kinds are matched by case-insensitive literal suffix over the lowercased full name: prompt = any name ending in `prompt.txt`; start/end = a name equal to, or ending in, `start.`/`end.` (any extension).
 "Ends with a number" means the filename stem (name minus final extension) ending in a digit run (so `frame1.png` and `a.1.png` count; `frame1b.png` does not).

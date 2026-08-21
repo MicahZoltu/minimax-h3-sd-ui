@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { thumbnailKey } from "../app/ts/media.js";
 import { createStore } from "../app/ts/state.js";
 import { memoryQueueBackend } from "./support/queueBackend.js";
+import type { HistoryMedia } from "../app/ts/history.js";
 import type { HistoryItem, QueueItem } from "../app/ts/types.js";
 
 let urlCounter = 0;
@@ -22,6 +23,8 @@ function historyItem(id: string): HistoryItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 512,
 		height: 512,
 		frameCount: 33,
@@ -37,6 +40,10 @@ function historyItem(id: string): HistoryItem {
 	};
 }
 
+function media(overrides: Partial<HistoryMedia> = {}): HistoryMedia {
+	return { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [] as Blob[], videoThumbs: [], videoAudios: [], videoSources: [], audioSources: [], ...overrides };
+}
+
 function queued(uid: string): QueueItem {
 	return {
 		id: uid,
@@ -45,6 +52,8 @@ function queued(uid: string): QueueItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,
@@ -160,9 +169,9 @@ describe("resident supersession", () => {
 		// If the lightbox arm merely re-read residentUrl() after its await, a superseded request would show the wrong
 		// video; the guard `store.residentId() !== id` is what keeps it from opening a mislabeled one.
 		const store = createStore(memoryQueueBackend());
-		const media = { video: new Blob(["va"]), thumbnail: new Blob(["ta"]), files: [] as Blob[] };
-		store.addHistory(historyItem("a"), media);
-		store.addHistory(historyItem("b"), { video: new Blob(["vb"]), thumbnail: new Blob(["tb"]), files: [] as Blob[] });
+		const mediaA = media({ video: new Blob(["va"]), thumbnail: new Blob(["ta"]) });
+		store.addHistory(historyItem("a"), mediaA);
+		store.addHistory(historyItem("b"), media({ video: new Blob(["vb"]), thumbnail: new Blob(["tb"]) }));
 
 		expect(store.residentId()).toBeNull();
 		const first = store.setResident("a");
@@ -177,12 +186,11 @@ describe("resident supersession", () => {
 describe("resident eviction", () => {
 	it("clears and revokes the resident when memory-trimming evicts its item id", async () => {
 		const store = createStore(memoryQueueBackend());
-		const media = { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [] as Blob[] };
 		const ids: string[] = [];
 		for (let i = 0; i < 100; i++) {
 			const id = `h_${i.toString().padStart(3, "0")}`;
 			ids.push(id);
-			store.addHistory(historyItem(id), media);
+			store.addHistory(historyItem(id), media());
 		}
 		// Make the oldest item the resident; its URL is created and owned by the objectUrl registry.
 		const residentId = "h_000";
@@ -193,7 +201,7 @@ describe("resident eviction", () => {
 		expect(residentUrl).toContain("blob:state/");
 
 		// Adding one more item pushes h_000 past the in-memory cap, evicting it via trimMemory.
-		store.addHistory(historyItem("h_101"), media);
+		store.addHistory(historyItem("h_101"), media());
 
 		expect(store.residentId()).toBeNull();
 		expect(store.residentUrl()).toBeNull();

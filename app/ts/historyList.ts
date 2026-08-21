@@ -76,5 +76,7 @@ export function buildHistoryRowSpecs(store: Store): ReconcileRowSpec[] {
 }
 
 export function historyItemBytes(item: HistoryItem): number {
-	return item.video.byteSize + item.thumbBytes + item.files.reduce((n, f) => n + f.bytes, 0);
+	const refBytes = (item.videos ?? []).reduce((n, v) => n + v.thumbBytes + v.audioBytes + v.sourceBytes, 0)
+		+ (item.audios ?? []).reduce((n, a) => n + a.bytes, 0);
+	return item.video.byteSize + item.thumbBytes + item.files.reduce((n, f) => n + f.bytes, 0) + refBytes;
 }

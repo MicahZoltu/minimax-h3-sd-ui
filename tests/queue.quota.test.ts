@@ -31,6 +31,8 @@ function queueItem(id: string, status: QueueItem["status"], serverId: string | n
 		zipName: "job.zip",
 		mode: "refs",
 		files: [{ name: "ref1.png", dataUrl: bigDataUrl ? "data:image/png;base64," + "A".repeat(4000) : "data:image/png;base64,QUFB" }],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,

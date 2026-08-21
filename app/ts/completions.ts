@@ -3,9 +3,9 @@
 // The DOM-bound thumbnail capture stays in queue.ts; its output is passed in as a raw artifact.
 
 import type { Job } from "./api.js";
-import { dataUrlToBlob, fileKey, thumbnailKey } from "./media.js";
+import { dataUrlToBlob, fileKey, refAudioKey, refVideoAudioKey, refVideoSourceKey, refVideoThumbKey, thumbnailKey } from "./media.js";
 import { GENERATION_PRESET } from "./request.js";
-import type { HistoryItem, PersistedFile, QueueItem } from "./types.js";
+import type { HistoryItem, PersistedFile, PersistedRefAudio, PersistedRefVideo, QueueItem } from "./types.js";
 import { uid } from "./utils.js";
 
 /** Raw completed-job artifacts that need a DOM step (video decode / thumbnail) to produce. */
@@ -23,7 +23,27 @@ export interface CompletionResult {
 	thumbBlob: Blob;
 	/** Media-store Blobs for the item's input files (an empty Blob keeps index alignment on a failed conversion). */
 	fileBlobs: Blob[];
+	/** First-frame preview Blobs for each reference video. */
+	videoThumbBlobs: Blob[];
+	/** WAV soundtrack Blobs per reference video (null when the video has no soundtrack). */
+	videoAudioBlobs: (Blob | null)[];
+	/** Original container Bytes per reference video. */
+	videoSourceBlobs: Blob[];
+	/** Original file Bytes per reference audio clip. */
+	audioSourceBlobs: Blob[];
 }
+
+// A malformed dataUrl must not strand a completed item: a failed conversion records bytes 0 (and an empty
+// Blob keeps index alignment) so the item still progresses out of the queue. Reference-media blobs use the same rule.
+function toBlob(dataUrl: string): Blob {
+	try {
+		return dataUrlToBlob(dataUrl);
+	} catch {
+		return new Blob([], { type: "application/octet-stream" });
+	}
+}
+
+const EMPTY_BLOB = new Blob([], { type: "application/octet-stream" });
 
 /**
  * Assemble the completion record for a finished job.
@@ -43,18 +63,34 @@ export function buildCompletion(item: QueueItem, job: Job, artifacts: Completion
 	const elapsedMs = Number.isFinite(completedSec - startedSec) ? Math.max(0, completedSec - startedSec) * 1000 : 0;
 
 	const historyId = uid("h_");
-	// A malformed dataUrl must not strand the completed item: a failed conversion records bytes 0 (and an
-	// empty Blob keeps index alignment) so the item still progresses out of the queue.
-	const fileBlobs: Blob[] = item.files.map((f) => {
-		try {
-			return dataUrlToBlob(f.dataUrl);
-		} catch {
-			return new Blob([], { type: "application/octet-stream" });
-		}
-	});
+	const fileBlobs: Blob[] = item.files.map((f) => toBlob(f.dataUrl));
 	const files: PersistedFile[] = item.files.map((f, index) => {
-		const blob = fileBlobs[index];
-		return { name: f.name, key: fileKey(historyId, index), bytes: blob ? blob.size : 0 };
+		const blob = fileBlobs[index] ?? EMPTY_BLOB;
+		return { name: f.name, key: fileKey(historyId, index), bytes: blob.size };
+	});
+
+	const videoThumbBlobs: Blob[] = item.videos.map((v) => toBlob(v.frames[0] ?? ""));
+	const videoAudioBlobs: (Blob | null)[] = item.videos.map((v) => (v.audio !== null ? toBlob(v.audio) : null));
+	const videoSourceBlobs: Blob[] = item.videos.map((v) => toBlob(v.sourceDataUrl));
+	const audioSourceBlobs: Blob[] = item.audios.map((a) => toBlob(a.sourceDataUrl));
+
+	const videos: PersistedRefVideo[] = item.videos.map((v, index) => {
+		const thumbBlob = videoThumbBlobs[index] ?? EMPTY_BLOB;
+		const audioBlob = videoAudioBlobs[index];
+		const sourceBlob = videoSourceBlobs[index] ?? EMPTY_BLOB;
+		return {
+			name: v.name,
+			thumbKey: refVideoThumbKey(historyId, index),
+			thumbBytes: thumbBlob.size,
+			audioKey: audioBlob ? refVideoAudioKey(historyId, index) : null,
+			audioBytes: audioBlob ? audioBlob.size : 0,
+			sourceKey: refVideoSourceKey(historyId, index),
+			sourceBytes: sourceBlob.size,
+		};
+	});
+	const audios: PersistedRefAudio[] = item.audios.map((a, index) => {
+		const sourceBlob = audioSourceBlobs[index] ?? EMPTY_BLOB;
+		return { name: a.name, key: refAudioKey(historyId, index), bytes: sourceBlob.size };
 	});
 
 	const historyItem: HistoryItem = {
@@ -64,6 +100,8 @@ export function buildCompletion(item: QueueItem, job: Job, artifacts: Completion
 		zipName: item.zipName,
 		mode: item.mode,
 		files,
+		videos,
+		audios,
 		width: item.width,
 		height: item.height,
 		frameCount,
@@ -78,5 +116,5 @@ export function buildCompletion(item: QueueItem, job: Job, artifacts: Completion
 		viewed: false,
 	};
 
-	return { historyItem, videoBlob: artifacts.videoBlob, thumbBlob: artifacts.thumbBlob, fileBlobs };
+	return { historyItem, videoBlob: artifacts.videoBlob, thumbBlob: artifacts.thumbBlob, fileBlobs, videoThumbBlobs, videoAudioBlobs, videoSourceBlobs, audioSourceBlobs };
 }

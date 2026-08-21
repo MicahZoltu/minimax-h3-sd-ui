@@ -54,6 +54,8 @@ export interface VidGenRequest {
 	end_image: string | null;
 	control_frames: unknown[];
 	ref_images: string[];
+	ref_videos: { frames: string[]; fps: number; audio?: string }[];
+	ref_audios: string[];
 	sample_params: SampleParams;
 	high_noise_sample_params: SampleParams;
 	lora: unknown[];
@@ -103,6 +105,17 @@ export function splitFrameInputs(item: QueueItem): { start: string | null; end: 
 
 export function buildVidGenRequest(item: QueueItem): VidGenRequest {
 	const { start, end, refs } = splitFrameInputs(item);
+	// Reference videos and audio ride alongside the image references, numbered independently per type.
+	// A ref_videos[].audio key is omitted (JSON.stringify drops `undefined`) when the video has no soundtrack.
+	// The `?? []` guards items persisted before reference-video/audio support, which lack these fields.
+	//
+	// A reference video is sampled up to a fixed cap at extraction time, before the form's frame count is known.
+	// Clamp the posted frames to the request's own video_frames, never dropping below the server's 5-frame minimum.
+	const refVideos = (item.videos ?? []).map((v) => {
+		const cap = Math.max(5, Math.min(item.jobFrames, v.frames.length));
+		return { frames: v.frames.slice(0, cap), fps: v.fps, ...(v.audio !== null ? { audio: v.audio } : {}) };
+	});
+	const refAudios = (item.audios ?? []).map((a) => a.dataUrl);
 	return {
 		prompt: item.prompt,
 		negative_prompt: "",
@@ -120,6 +133,8 @@ export function buildVidGenRequest(item: QueueItem): VidGenRequest {
 		end_image: end,
 		control_frames: [],
 		ref_images: refs,
+		ref_videos: refVideos,
+		ref_audios: refAudios,
 
 		sample_params: sampleParams(item.steps),
 		high_noise_sample_params: {

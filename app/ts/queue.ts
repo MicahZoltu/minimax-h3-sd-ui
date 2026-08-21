@@ -195,9 +195,9 @@ async function handleCompleted(store: Store, itemId: string, job: Job): Promise<
 			// Thumbnail decode is best-effort; a missing preview must not fail the generation.
 			thumbBlob = new Blob([], { type: "image/jpeg" });
 		}
-		const { historyItem, videoBlob: recordedVideo, thumbBlob: recordedThumb, fileBlobs } = buildCompletion(item, job, { videoBlob, thumbBlob, format, mime });
+		const { historyItem, videoBlob: recordedVideo, thumbBlob: recordedThumb, fileBlobs, videoThumbBlobs, videoAudioBlobs, videoSourceBlobs, audioSourceBlobs } = buildCompletion(item, job, { videoBlob, thumbBlob, format, mime });
 
-		store.addHistory(historyItem, { video: recordedVideo, thumbnail: recordedThumb, files: fileBlobs });
+		store.addHistory(historyItem, { video: recordedVideo, thumbnail: recordedThumb, files: fileBlobs, videoThumbs: videoThumbBlobs, videoAudios: videoAudioBlobs, videoSources: videoSourceBlobs, audioSources: audioSourceBlobs });
 		store.removeQueue(itemId);
 		void store.setResident(historyItem.id, recordedVideo);
 	} catch (err) {

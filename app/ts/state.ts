@@ -4,7 +4,7 @@
 
 import { getCapabilities, supportsVideoProgress, type Capabilities, type JobProgress } from "./api.js";
 import { getApiBase, getDefaultBase, setApiBase as writeApiBase, resetApiBase as clearApiBase } from "./config.js";
-import { createHistoryStore, detectSyncStorage, type QueueBackend, type SyncStorage } from "./history.js";
+import { createHistoryStore, detectSyncStorage, type HistoryMedia, type QueueBackend, type SyncStorage } from "./history.js";
 import { createIdbHistory, createIdbQueue } from "./idb.js";
 import { videoKey } from "./media.js";
 import { getOrCreate, revokeById } from "./objectUrl.js";
@@ -77,6 +77,8 @@ const QUEUE_KEYS = [
 	"prompt",
 	"mode",
 	"files",
+	"videos",
+	"audios",
 	"width",
 	"height",
 	"jobFrames",
@@ -167,7 +169,7 @@ export interface Store {
 	setQueueProgress(id: string, progress: JobProgress): void;
 	removeQueue(id: string): void;
 	moveQueue(from: number, to: number): void;
-	addHistory(item: HistoryItem, media: { video: Blob; thumbnail: Blob; files: Blob[] }): void;
+	addHistory(item: HistoryItem, media: HistoryMedia): void;
 	/** Mark a completed history item as viewed (clears its "new" highlight and favicon contribution). */
 	markHistoryViewed(id: string): void;
 	removeHistory(id: string): void;
@@ -402,7 +404,7 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			persistQueue();
 			emit("queue");
 		},
-		addHistory: (item, media) => {
+		addHistory: (item, media: HistoryMedia) => {
 			history.add(item, media);
 			emit("history");
 		},

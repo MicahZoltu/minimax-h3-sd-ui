@@ -241,6 +241,11 @@ body {
 	width: fit-content;
 }
 
+button.badge {
+	font-family: inherit;
+	cursor: pointer;
+}
+
 .analysis {
 	display: flex;
 	flex-direction: column;
@@ -308,7 +313,12 @@ body {
 
 .actions {
 	display: flex;
-	justify-content: flex-end;
+	justify-content: flex-start;
+	gap: 8px;
+}
+
+.actions-spacer {
+	flex: 1 1 auto;
 }
 
 /* ---- buttons ---- */
@@ -532,6 +542,13 @@ body {
 	gap: 8px;
 }
 
+.ref-audios {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+}
+
 .thumb {
 	width: 56px;
 	height: 56px;
@@ -566,6 +583,13 @@ body {
 	max-height: calc(100vh - 96px);
 	border-radius: 8px;
 	background: #000;
+}
+
+.lightbox-audio {
+	width: 340px;
+	max-width: calc(100vw - 48px);
+	background: none;
+	border-radius: 0;
 }
 
 .lightbox-bar {
@@ -732,4 +756,46 @@ body {
 .modal-actions {
 	display: flex;
 	justify-content: flex-end;
+}
+
+/* ---- codec support modal ---- */
+.codec-overlay {
+	z-index: 30;
+}
+
+.codec-modal {
+	min-width: 320px;
+	max-width: 460px;
+}
+
+.codec-modal h3 {
+	margin: 0;
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: 0.6px;
+	color: var(--muted);
+}
+
+.codec-note {
+	margin: 0;
+	font-size: 13px;
+	color: var(--warn);
+}
+
+.codec-list {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 8px;
+}
+
+.codec-list li {
+	padding: 2px 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--panel-2);
+	font-size: 12px;
+	color: var(--text);
 }

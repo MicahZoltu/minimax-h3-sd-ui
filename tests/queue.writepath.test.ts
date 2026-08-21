@@ -11,6 +11,8 @@ function queued(uid: string): QueueItem {
 		zipName: "d.zip",
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,

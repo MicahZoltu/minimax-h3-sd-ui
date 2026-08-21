@@ -23,6 +23,31 @@ export function fileKey(id: string, index: number): string {
 	return `${fileKeyPrefix(id)}${index}`;
 }
 
+/** The shared prefix for every media-store key belonging to a history item's NTH reference video. */
+export function refVideoPrefix(id: string, index: number): string {
+	return `${id}:vref:${index}:`;
+}
+
+/** Media-store key of a reference video's first-frame preview image. */
+export function refVideoThumbKey(id: string, index: number): string {
+	return `${refVideoPrefix(id, index)}thumb`;
+}
+
+/** Media-store key of a reference video's WAV soundtrack. */
+export function refVideoAudioKey(id: string, index: number): string {
+	return `${refVideoPrefix(id, index)}audio`;
+}
+
+/** Media-store key of a reference video's original container bytes. */
+export function refVideoSourceKey(id: string, index: number): string {
+	return `${refVideoPrefix(id, index)}src`;
+}
+
+/** Media-store key of the NTH reference audio clip's original file bytes. */
+export function refAudioKey(id: string, index: number): string {
+	return `${id}:aref:${index}`;
+}
+
 /**
  * Decode a base64 data URL into a Blob carrying the declared MIME type.
  * Falls back to application/octet-stream when no MIME is declared or the data: prefix is missing.

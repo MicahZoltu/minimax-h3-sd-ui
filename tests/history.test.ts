@@ -1,14 +1,12 @@
 import { describe, it, expect } from "bun:test";
-import { createHistoryStore, estimateStorage, isHistoryItem, isQueueItem, type HistoryBackend } from "../app/ts/history.js";
+import { createHistoryStore, estimateStorage, isHistoryItem, isQueueItem, type HistoryBackend, type HistoryMedia } from "../app/ts/history.js";
 import { createIdbHistory, createIdbQueue } from "../app/ts/idb.js";
 import { fileKey, thumbnailKey, videoKey } from "../app/ts/media.js";
 import { memoryQueueBackend } from "./support/queueBackend.js";
 import type { HistoryItem, QueueItem } from "../app/ts/types.js";
 
-type AddMedia = { video: Blob; thumbnail: Blob; files: Blob[] };
-
-function dummyMedia(): AddMedia {
-	return { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [] };
+function dummyMedia(overrides: Partial<HistoryMedia> = {}): HistoryMedia {
+	return { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [], videoThumbs: [], videoAudios: [], videoSources: [], audioSources: [], ...overrides };
 }
 
 function makeQueueItem(partial: Partial<QueueItem> = {}): QueueItem {
@@ -19,6 +17,8 @@ function makeQueueItem(partial: Partial<QueueItem> = {}): QueueItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,
@@ -39,6 +39,8 @@ function makeItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 512,
 		height: 512,
 		frameCount: 33,
@@ -228,6 +230,8 @@ describe("no-browser fallback (Bun has no indexedDB)", () => {
 			zipName: null,
 			mode: "prompt",
 			files: [],
+			videos: [],
+			audios: [],
 			width: 512,
 			height: 512,
 			frameCount: 33,
@@ -312,7 +316,7 @@ describe("createHistoryStore", () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const item = makeItem();
-		store.add(item, { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [new Blob(["f0"]), new Blob(["f1"])] });
+		store.add(item, dummyMedia({ files: [new Blob(["f0"]), new Blob(["f1"])] }));
 		await flush();
 		expect(backend.media(thumbnailKey(item.id))).not.toBeNull();
 		expect(backend.media(fileKey(item.id, 0))).not.toBeNull();
@@ -325,7 +329,7 @@ describe("createHistoryStore", () => {
 		const store = createHistoryStore(backend);
 		const item = makeItem();
 		const thumb = new Blob(["thumb"]);
-		store.add(item, { video: new Blob(["v"]), thumbnail: thumb, files: [new Blob(["f0"])] });
+		store.add(item, dummyMedia({ thumbnail: thumb, files: [new Blob(["f0"])] }));
 		await flush();
 
 		// The blobs were cached at add() time, so the loads never hit the backend.
@@ -360,7 +364,7 @@ describe("createHistoryStore", () => {
 		const store = createHistoryStore(null);
 		const id = "h_mem";
 		const item = { ...makeItem({ id }), files: [{ name: "a.png", key: fileKey(id, 0), bytes: 2 }] };
-		store.add(item, { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [new Blob(["f0"])] });
+		store.add(item, dummyMedia({ files: [new Blob(["f0"])] }));
 		const thumb = await store.loadThumbnail(id);
 		const file = await store.loadFileByKey(item.files[0]?.key ?? "");
 		expect(thumb).not.toBeNull();
@@ -400,7 +404,7 @@ describe("createHistoryStore", () => {
 				{ name: "b.png", key: fileKey(id, 1), bytes: 2 },
 			],
 		};
-		store.add(item, { video: new Blob(["v"]), thumbnail: new Blob(["t"]), files: [new Blob(["f0"]), new Blob(["f1"])] });
+		store.add(item, dummyMedia({ files: [new Blob(["f0"]), new Blob(["f1"])] }));
 		await flush();
 
 		expect(backend.media(videoKey(id))).not.toBeNull();
@@ -541,7 +545,7 @@ describe("createHistoryStore", () => {
 		const created: HistoryItem[] = [];
 		for (let i = 0; i < 105; i++) {
 			const item = makeItem({ createdAt: i });
-			store.add(item, { video: new Blob([`v${i}`]), thumbnail: new Blob([`t${i}`]), files: [new Blob([`f${i}`])] });
+			store.add(item, dummyMedia({ video: new Blob([`v${i}`]), thumbnail: new Blob([`t${i}`]), files: [new Blob([`f${i}`])] }));
 			created.push(item);
 		}
 		await flush();

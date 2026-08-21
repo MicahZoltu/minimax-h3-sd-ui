@@ -31,13 +31,17 @@ export interface LightboxHandle {
 }
 
 interface LightboxState {
-	kind: "image" | "video";
+	// "ref-video" / "ref-audio" are the reference-input players.
+	// Unlike "video" they never use the store's resident machinery (hover-autoplay / memory residency): their blob is owned by this lightbox alone and revoked on close, so a reference preview never becomes the resident generation.
+	kind: "image" | "video" | "ref-video" | "ref-audio";
 	src: string;
 	filename: string;
 	stem: string;
 	plan: CompressionPlan | null;
 	reason: UnsupportedReason | null;
 	imageBlob?: Blob;
+	/** Object URL this lightbox owns for reference playback; revoked when the lightbox closes. */
+	refUrl?: string;
 }
 
 export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxHandle {
@@ -49,9 +53,11 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 			return;
 		}
 		const lb = lightbox;
-		// The bar always reads "Download • Download Compressed • Close".
+		// The generation bar reads "Download • Download Compressed • Close"; the reference-input players are playback-only and show just Close (no download / compression controls).
 		// Cancellation does not live here: a transient progress row (bar + Cancel) is managed imperatively below and exists only while a compression is running.
-		const barChildren: Child[] = [h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download")];
+		const barChildren: Child[] = [];
+		const hasDownload = lb.kind === "image" || lb.kind === "video";
+		if (hasDownload) barChildren.push(h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download"));
 		if (lb.kind === "video") {
 			const plan = lb.plan;
 			const ready = plan !== null;
@@ -63,17 +69,33 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 		}
 		barChildren.push(h("button", { class: "btn", "data-action": "close-lightbox" }, "Close"));
 		lightboxEl.style.display = "block";
+		const media: Child =
+			lb.kind === "ref-video"
+				? h("video", { class: "lightbox-media", src: lb.src, controls: true, playsinline: true, autoplay: true })
+				: lb.kind === "ref-audio"
+					? h("audio", { class: "lightbox-media lightbox-audio", src: lb.src, controls: true, autoplay: true })
+					: lb.kind === "video"
+						? h("video", { class: "lightbox-media", src: lb.src, controls: true, playsinline: true, autoplay: true })
+						: h("img", { class: "lightbox-media", src: lb.src, alt: "Enlarged media" });
 		lightboxEl.appendChild(
 			h("div", { class: "overlay lightbox-overlay" }, [
 				// Column wrapper lets the button bar and progress row span the wider of the media or bar, centered like the rest of the lightbox.
 				h("div", { class: "lightbox-column" }, [
-					lb.kind === "video"
-						? h("video", { class: "lightbox-media", src: lb.src, controls: true, playsinline: true, autoplay: true })
-						: h("img", { class: "lightbox-media", src: lb.src, alt: "Enlarged media" }),
+					media,
 					h("div", { class: "lightbox-bar" }, barChildren),
 				]),
 			]),
 		);
+	};
+	// Release the blob a reference player owns (if any) and drop the lightbox.
+	// Reference playback intentionally bypasses the store's resident machinery, so its object URL is owned here and must be revoked so a clicked reference never lingers in memory or becomes hover-autoplay content.
+	const disposeState = (state: LightboxState | null): void => {
+		if (state?.refUrl) URL.revokeObjectURL(state.refUrl);
+	};
+	const closeLightbox = (): void => {
+		disposeState(lightbox);
+		lightbox = null;
+		renderLightbox();
 	};
 	// Probe the resident blob once (idempotently) when a video lightbox opens, then enable the compress button if a plan is viable.
 	// Stale results (the lightbox changed or closed meanwhile) are ignored.
@@ -208,6 +230,7 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 		const fallback = ctx.element.getAttribute("src") ?? "";
 		const show = (src: string, imageBlob?: Blob): void => {
 			if (!src) return;
+			disposeState(lightbox);
 			const state: LightboxState = { kind: "image", src, filename: name || "image", stem: "", plan: null, reason: null };
 			if (imageBlob) state.imageBlob = imageBlob;
 			lightbox = state;
@@ -244,11 +267,89 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 			if (store.residentId() !== id) return;
 			const src = store.residentUrl();
 			if (src) {
+				disposeState(lightbox);
 				lightbox = { kind: "video", src, filename, stem, plan: null, reason: null };
 				renderLightbox();
 				void probeVideoCompression(store, lightbox);
 			}
 		})();
+	};
+	// Open the reference-video player for the given file (by name, within a history/queue item id when present).
+	// When the source lives in history it is loaded from IndexedDB on click and owned as an object URL by this lightbox (revoked on close).
+	// In the form/queue the source data URL already rides on the item, so it is shown directly.
+	const openRefVideo = (ctx: LightboxActionContext): void => {
+		ctx.event.stopPropagation();
+		const name = ctx.element.getAttribute("data-name") ?? "";
+		const id = ctx.element.getAttribute("data-id") ?? "";
+		const show = (src: string, refUrl?: string): void => {
+			if (!src) return;
+			disposeState(lightbox);
+			lightbox = { kind: "ref-video", src, filename: name || "reference video", stem: "", plan: null, reason: null };
+			if (refUrl) lightbox.refUrl = refUrl;
+			renderLightbox();
+		};
+		if (id) {
+			const hist = store.history.items().find((i) => i.id === id);
+			if (hist) {
+				const video = (hist.videos ?? []).find((v) => v.name === name);
+				if (video) {
+					void store.history.loadFileByKey(video.sourceKey).then((blob) => {
+						// Load the original container bytes on click; the owned object URL is later revoked on close.
+						if (blob) {
+							const url = URL.createObjectURL(blob);
+							show(url, url);
+						}
+					}).catch(() => {});
+					return;
+				}
+			}
+			const qitem = store.state.queue.find((i) => i.id === id);
+			if (qitem) {
+				const video = (qitem.videos ?? []).find((v) => v.name === name);
+				if (video) show(video.sourceDataUrl);
+			}
+			return;
+		}
+		const formVideo = store.state.form.analysis?.videos.find((v) => v.name === name);
+		if (formVideo) show(formVideo.sourceDataUrl);
+	};
+	// Open the reference-audio player for the given file, loading history bytes on click (owned object URL revoked on close).
+	// The already-in-memory data URL is used when the source is the form or a queued item.
+	const openRefAudio = (ctx: LightboxActionContext): void => {
+		ctx.event.stopPropagation();
+		const name = ctx.element.getAttribute("data-name") ?? "";
+		const id = ctx.element.getAttribute("data-id") ?? "";
+		const show = (src: string, refUrl?: string): void => {
+			if (!src) return;
+			disposeState(lightbox);
+			lightbox = { kind: "ref-audio", src, filename: name || "reference audio", stem: "", plan: null, reason: null };
+			if (refUrl) lightbox.refUrl = refUrl;
+			renderLightbox();
+		};
+		if (id) {
+			const hist = store.history.items().find((i) => i.id === id);
+			if (hist) {
+				const audio = (hist.audios ?? []).find((a) => a.name === name);
+				if (audio) {
+					void store.history.loadFileByKey(audio.key).then((blob) => {
+						// Load the persisted audio bytes on click; the owned object URL is later revoked on close.
+						if (blob) {
+							const url = URL.createObjectURL(blob);
+							show(url, url);
+						}
+					}).catch(() => {});
+					return;
+				}
+			}
+			const qitem = store.state.queue.find((i) => i.id === id);
+			if (qitem) {
+				const audio = (qitem.audios ?? []).find((a) => a.name === name);
+				if (audio) show(audio.dataUrl);
+			}
+			return;
+		}
+		const formAudio = store.state.form.analysis?.audios.find((a) => a.name === name);
+		if (formAudio) show(formAudio.dataUrl);
 	};
 	const downloadLightboxMedia = (): void => {
 		if (!lightbox) return;
@@ -266,8 +367,7 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 		handleBackdropClose: (): void => {
 			// Clicking the overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
 			if (activeCompression) return;
-			lightbox = null;
-			renderLightbox();
+			closeLightbox();
 		},
 		handleAction: (action, ctx): void => {
 			switch (action) {
@@ -276,6 +376,12 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 					break;
 				case "view-video":
 					openVideo(ctx);
+					break;
+				case "view-ref-video":
+					openRefVideo(ctx);
+					break;
+				case "view-ref-audio":
+					openRefAudio(ctx);
 					break;
 				case "download-compressed":
 					ctx.event.stopPropagation();
@@ -291,8 +397,7 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 				case "close-lightbox":
 					// Closing is refused while a compression runs; the Close button is also disabled during that window.
 					if (activeCompression) return;
-					lightbox = null;
-					renderLightbox();
+					closeLightbox();
 					break;
 				default:
 					break;

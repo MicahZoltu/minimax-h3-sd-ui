@@ -11,6 +11,8 @@ function baseItem(partial: Partial<QueueItem> = {}): QueueItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,
@@ -107,5 +109,41 @@ describe("buildVidGenRequest", () => {
 		const body = buildVidGenRequest(item);
 		expect(body.ref_images).toEqual(["data:1", "data:2"]);
 		expect(body.init_image).toBe(null);
+	});
+
+	it("serializes reference videos with frames, real fps, and an optional soundtrack", () => {
+		const item = baseItem({
+			mode: "refs",
+			videos: [
+				{ name: "clip.mp4", fps: 60, frames: ["data:a", "data:b"], audio: "data:wav", sourceDataUrl: "data:mp4" },
+				{ name: "silent.mp4", fps: 24, frames: ["data:c"], audio: null, sourceDataUrl: "data:mp4" },
+			],
+		});
+		const body = buildVidGenRequest(item);
+		expect(body.ref_videos).toEqual([
+			{ frames: ["data:a", "data:b"], fps: 60, audio: "data:wav" },
+			{ frames: ["data:c"], fps: 24 },
+		]);
+		expect(body.ref_audios).toEqual([]);
+		// References are mutually exclusive with first/last-frame conditioning.
+		expect(body.init_image).toBe(null);
+		expect(body.end_image).toBe(null);
+	});
+
+	it("serializes reference audio as WAV data URLs", () => {
+		const item = baseItem({
+			mode: "refs",
+			audios: [{ name: "tune.mp3", dataUrl: "data:audio/wav;base64,QQ==", sourceDataUrl: "data:mp3" }],
+		});
+		const body = buildVidGenRequest(item);
+		expect(body.ref_audios).toEqual(["data:audio/wav;base64,QQ=="]);
+		expect(body.ref_videos).toEqual([]);
+	});
+
+	it("keeps init/end conditioning only when no reference of any type is present", () => {
+		const plain = baseItem({ mode: "prompt", videos: [], audios: [] });
+		expect(buildVidGenRequest(plain).init_image).toBe(null);
+		const withAudio = baseItem({ mode: "refs", audios: [{ name: "a.wav", dataUrl: "data:audio/wav;base64,QQ==", sourceDataUrl: "data:wav" }] });
+		expect(buildVidGenRequest(withAudio).init_image).toBe(null);
 	});
 });

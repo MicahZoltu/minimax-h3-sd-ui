@@ -15,6 +15,8 @@ function item(partial: Partial<QueueItem> = {}): QueueItem {
 		zipName: null,
 		mode: "prompt",
 		files: [],
+		videos: [],
+		audios: [],
 		width: 640,
 		height: 384,
 		jobFrames: 49,

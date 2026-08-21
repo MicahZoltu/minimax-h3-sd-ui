@@ -3,6 +3,7 @@
 // No markup is ever built from unescaped strings, so uploaded prompts / file names are always safe.
 
 import { cancelJob } from "./api.js";
+import { buildCodecModal, probeCodecSupport, type CodecSupport } from "./codecs.js";
 import { h, clear } from "./dom.js";
 import { downloadBlob } from "./download.js";
 import { setupFavicon } from "./favicon.js";
@@ -36,6 +37,28 @@ export function mount(store: Store, root: HTMLElement): void {
 	let storageModalOpen = false;
 	let lastEstimate: { usage: number; quota: number } | null = null;
 	let storageMeterRefreshing = false;
+
+	let codecModalOpen = false;
+	let codecSupport: CodecSupport | null = null;
+	let codecSupportLoading = false;
+	const renderCodecModal = (): void => {
+		clear(codecRootEl);
+		if (!codecModalOpen) {
+			codecRootEl.style.display = "none";
+			return;
+		}
+		codecRootEl.style.display = "block";
+		codecRootEl.appendChild(buildCodecModal(codecSupport ?? { video: [], audio: [], note: "Probing codec support…" }));
+	};
+	const loadCodecSupport = async (): Promise<void> => {
+		if (codecSupport || codecSupportLoading) return;
+		codecSupportLoading = true;
+		const support = await probeCodecSupport();
+		codecSupportLoading = false;
+		codecSupport = support;
+		// Only re-render if the modal is still open; a closed modal picks the cached result up on the next open.
+		if (codecModalOpen) renderCodecModal();
+	};
 	const refreshStorageMeter = async (): Promise<void> => {
 		if (storageMeterRefreshing) return;
 		storageMeterRefreshing = true;
@@ -79,6 +102,7 @@ export function mount(store: Store, root: HTMLElement): void {
 		buildLayout(),
 		h("div", { id: "lightbox-root" }),
 		h("div", { id: "storage-root" }),
+		h("div", { id: "codec-root" }),
 	]);
 	clear(root);
 	root.appendChild(app);
@@ -90,6 +114,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	const listEmptyEl = requiredElement(layout.querySelector("#listEmpty"), isHTMLElement, "list empty");
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
 	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
+	const codecRootEl = requiredElement(app.querySelector("#codec-root"), isHTMLElement, "codec root");
 	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to
 	// consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
 	const box = createLightbox(store, lightboxEl);
@@ -161,7 +186,12 @@ export function mount(store: Store, root: HTMLElement): void {
 			renderStorageModal();
 			return;
 		}
-		// The storage overlay carries both `overlay` and `storage-overlay`, so it is caught by the storage branch above and never reaches here.
+		if (target.classList.contains("codec-overlay")) {
+			codecModalOpen = false;
+			renderCodecModal();
+			return;
+		}
+		// The storage and codec overlays each carry both `overlay` and their own class, so they are caught by the branches above and never reach here.
 		// Clicking any other overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
 		if (target.classList.contains("overlay")) {
 			box.handleBackdropClose();
@@ -178,6 +208,15 @@ export function mount(store: Store, root: HTMLElement): void {
 			event.stopPropagation();
 			storageModalOpen = false;
 			renderStorageModal();
+		} else if (action === "open-codecs") {
+			event.stopPropagation();
+			codecModalOpen = true;
+			renderCodecModal();
+			void loadCodecSupport();
+		} else if (action === "close-codecs") {
+			event.stopPropagation();
+			codecModalOpen = false;
+			renderCodecModal();
 		} else if (action !== null) {
 			// All remaining arms (image/video open, downloads, cancel, close) belong to the lightbox module.
 			box.handleAction(action, { event, element: actionEl });
@@ -283,6 +322,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	renderHistoryDomain();
 	renderResidentDomain();
 	renderStorageDomain();
+	renderCodecModal();
 
 	// Update live elapsed timers and progress bars in place (does not rebuild video elements).
 	setInterval(() => updateLive(store), 1000);
@@ -370,38 +410,62 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 		const kind = el.getAttribute("data-files-kind");
 		if (!id || populating.has(id)) return;
 		if (kind === "history") {
-			// History file bytes live as Blobs; load each on demand and attach only once it resolves and the details are still open.
+			// History media bytes live as Blobs; load each on demand and attach only once it resolves and the details are still open.
 			const item = store.history.items().find((i) => i.id === id);
-			if (!item || item.files.length === 0) return;
+			if (!item || (item.files.length === 0 && item.videos?.length === 0 && item.audios?.length === 0)) return;
 			populating.add(id);
-			let remaining = item.files.length;
-			// Load each blob by the file's RECORDED media-store key, never by a renumbered array index.
+			// Load each blob by the RECORDED media-store key, never by a renumbered array index.
 			// A record's file keys are authoritative and can be non-contiguous with the array (e.g. legacy items
 			// migrated from inline base64 that skipped a non-object entry); an array index would read the wrong key and drop the image.
+			const done = () => {
+				remaining -= 1;
+				if (remaining <= 0) populating.delete(id);
+			};
+			// Do not hold the .thumbs node captured at toggle time and write into it on resolve: the keyed
+			// reconcile (renderHistorySection) can rebuild the row while an async IndexedDB load is in flight,
+			// detaching that old container so a resolved blob would be dropped by the isConnected guard and the
+			// images would never appear. Re-resolve the current row by data-id and its live .thumbs at resolve
+			// time instead, so a freshly rendered row still receives the thumbs.
+			const liveContainer = () => {
+				const liveRow = maybeElement(root.querySelector(`details[data-lazy-files="${CSS.escape(id)}"]`), isHTMLElement);
+				return liveRow ? maybeElement(liveRow.querySelector(".thumbs"), isHTMLElement) : null;
+			};
+			const appendRefThumb = (blob: Blob | null, key: string, name: string, action: string): void => {
+				const live = liveContainer();
+				if (!blob || !live || !live.isConnected) return;
+				const img = h("img", { class: "thumb", alt: name, title: name, "data-action": action, "data-name": name, "data-id": id, decoding: "async", loading: "lazy" });
+				if (img instanceof HTMLImageElement) img.src = getOrCreate(key, blob);
+				live.appendChild(img);
+			};
+			let remaining = item.files.length + (item.videos?.length ?? 0);
 			item.files.forEach((file) => {
-				void store.history.loadFileByKey(file.key).then((blob) => {
-					// Do not hold the .thumbs node captured at toggle time and write into it on resolve: the keyed
-					// reconcile (renderHistorySection) can rebuild the row while an async IndexedDB load is in flight,
-					// detaching that old container so a resolved blob would be dropped by the isConnected guard and the
-					// images would never appear. Re-resolve the current row by data-id and its live .thumbs at resolve
-					// time instead, so a freshly rendered row still receives the thumbs.
-					const liveRow = maybeElement(root.querySelector(`details[data-lazy-files="${CSS.escape(id)}"]`), isHTMLElement);
-					const liveContainer = liveRow ? maybeElement(liveRow.querySelector(".thumbs"), isHTMLElement) : null;
-					if (!blob || !liveContainer || !liveContainer.isConnected) return;
-					const img = h("img", { class: "thumb", alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" });
-					if (img instanceof HTMLImageElement) img.src = getOrCreate(file.key, blob);
-					liveContainer.appendChild(img);
-				}).finally(() => {
-					remaining -= 1;
-					if (remaining <= 0) populating.delete(id);
-				}).catch(() => {});
+				void store.history.loadFileByKey(file.key).then((blob) => appendRefThumb(blob, file.key, file.name, "view-image")).finally(done).catch(() => {});
 			});
+			(item.videos ?? []).forEach((video) => {
+				void store.history.loadFileByKey(video.thumbKey).then((blob) => appendRefThumb(blob, video.thumbKey, video.name, "view-ref-video")).finally(done).catch(() => {});
+			});
+			if ((item.audios?.length ?? 0) > 0) {
+				const live = liveContainer();
+				if (live && live.isConnected) {
+					const audioEl = h("div", { class: "ref-audios" });
+					for (const a of item.audios) audioEl.appendChild(h("button", { class: "badge", type: "button", title: `Play ${a.name}`, "data-action": "view-ref-audio", "data-name": a.name, "data-id": id }, a.name));
+					live.appendChild(audioEl);
+				}
+			}
 			return;
 		}
-		const files = kind === "queue" ? store.state.queue.find((i) => i.id === id)?.files : undefined;
-		if (!files || files.length === 0) return;
-		for (const file of files) {
+		const qitem = kind === "queue" ? store.state.queue.find((i) => i.id === id) : undefined;
+		if (!qitem || (qitem.files.length === 0 && (qitem.videos?.length ?? 0) === 0 && (qitem.audios?.length ?? 0) === 0)) return;
+		for (const file of qitem.files) {
 			container.appendChild(h("img", { class: "thumb", src: file.dataUrl, alt: file.name, title: file.name, "data-action": "view-image", "data-name": file.name, "data-id": id, decoding: "async", loading: "lazy" }));
+		}
+		for (const video of qitem.videos ?? []) {
+			container.appendChild(h("img", { class: "thumb", src: video.frames[0] ?? "", alt: video.name, title: `Play ${video.name}`, "data-action": "view-ref-video", "data-name": video.name, "data-id": id, decoding: "async", loading: "lazy" }));
+		}
+		if ((qitem.audios?.length ?? 0) > 0) {
+			const audioEl = h("div", { class: "ref-audios" });
+			for (const a of qitem.audios) audioEl.appendChild(h("button", { class: "badge", type: "button", title: `Play ${a.name}`, "data-action": "view-ref-audio", "data-name": a.name, "data-id": id }, a.name));
+			container.appendChild(audioEl);
 		}
 	}, true);
 
@@ -494,6 +558,8 @@ function addToQueue(store: Store): void {
 		zipName: f.zipName,
 		mode: analysis.mode,
 		files: analysis.files,
+		videos: analysis.videos,
+		audios: analysis.audios,
 		width,
 		height,
 		jobFrames: frames,
@@ -514,12 +580,16 @@ async function downloadSourceZip(store: Store, id: string): Promise<void> {
 	// Load by the file's recorded media-store key, never by a renumbered array index: a legacy
 	// record's keys can be non-contiguous with the array, and an index read would drop files from the zip.
 	const source: { name: string; bytes: Uint8Array }[] = [];
-	for (const file of item.files) {
+	const pushSource = async (name: string, key: string): Promise<void> => {
 		// A missing blob is skipped gracefully; the rest of the files still land in the zip.
-		const blob = await store.history.loadFileByKey(file.key);
-		if (!blob) continue;
-		source.push({ name: file.name, bytes: new Uint8Array(await blob.arrayBuffer()) });
-	}
+		const blob = await store.history.loadFileByKey(key);
+		if (!blob) return;
+		source.push({ name, bytes: new Uint8Array(await blob.arrayBuffer()) });
+	};
+	for (const file of item.files) await pushSource(file.name, file.key);
+	// The original container/file bytes reproduce the reference videos and audio in the regenerated zip.
+	for (const video of item.videos ?? []) await pushSource(video.name, video.sourceKey);
+	for (const audio of item.audios ?? []) await pushSource(audio.name, audio.key);
 	const blob = buildSourceZip(source, item.prompt);
 	downloadBlob(blob, item.zipName ?? `${id}.zip`);
 }

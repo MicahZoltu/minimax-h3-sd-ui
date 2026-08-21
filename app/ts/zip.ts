@@ -4,26 +4,37 @@
 //   - any file whose (lowercased) name ends with `prompt.txt`   -> prompt
 //   - a name equal to `start`, or ending in `start.<anything>`  -> start image
 //   - a name equal to `end`,   or ending in `end.<anything>`    -> end image
-//   - otherwise, a stem (name minus last extension) ending in a digit run (*1, *2, ...)  -> reference frame
+//   - otherwise, a stem (name minus last extension) ending in a digit run (*1, *2, ...)  -> numbered reference, typed by extension:
+//       a png/jpg/jpeg/webp/bmp image  -> reference frame ("frame")
+//       a container video (mp4/mov/webm/m4v)  -> reference video ("video")
+//       an audio file (wav/mp3/m4a/aac/flac/ogg)  -> reference audio ("audio")
 //   - anything else                                            -> "other" (rejected)
-// prompt.txt matching is checked before start/end/frame.
+// prompt.txt matching is checked before start/end/numbered files.
 //
 // A valid upload zip contains exactly one prompt file plus exactly one of:
 //   - nothing else                          -> text-only generation (mode "prompt")
 //   - a start and/or end image file          -> start/end frame generation (mode "start-end")
-//   - numerated frame files (*1, *2, ...)    -> reference frame generation (mode "refs")
+//   - numbered reference files               -> reference generation (mode "refs")
 //
-// Numbered files must form a contiguous, gap-free sequence from 1 up to N (N <= 9).
-// Any extra file, a missing prompt, conflicting input kinds, or a non-contiguous frame sequence is reported as an error before the zip is accepted.
+// Reference numbering is PER TYPE (images, videos and audio each number independently from 1), so `1.png`, `1.mp4` and `1.wav` coexist.
+// Each numbered group must form a contiguous, gap-free sequence from 1 up to its cap.
+// Operating limits are enforced on upload: at most 9 images, 3 videos and 3 audio clips, and 12 reference files total across all types.
+// Start/end files cannot be mixed with any numbered reference, because Ref2VA references and first/last-frame conditioning are mutually exclusive.
+// Any extra file, a missing prompt, conflicting input kinds, or a non-contiguous numbered group is reported as an error before the zip is accepted.
+//
+// Images are decoded to PNG/JPEG/WEBP/BMP data URLs here. Video and audio files are handed to the reference extraction worker (refExtract).
+// A video becomes an ordered frame list, its real fps, and an optional WAV soundtrack; any audio is transcoded to WAV.
+// The original container bytes are retained so a regenerated source zip reproduces the upload.
 //
 // The container format is parsed directly here using the local/central directory records; deflate entries are inflated with the native `DecompressionStream`, so no external zip library is required.
 
-import { bytesToDataUrl } from "./utils.js";
-import type { ZipAnalysis, ZipFile } from "./types.js";
+import { bytesToBlob, bytesToDataUrl } from "./utils.js";
+import { extractRefVideo, transcodeAudioRef } from "./refExtract.js";
+import type { RefAudioFile, RefVideoFile, ZipAnalysis, ZipFile } from "./types.js";
 
 export interface ClassifiedEntry {
-	kind: "prompt" | "start" | "end" | "frame" | "other";
-	/** Frame number when kind === "frame". */
+	kind: "prompt" | "start" | "end" | "frame" | "video" | "audio" | "other";
+	/** Number within its own file type when kind is a numbered reference ("frame" | "video" | "audio"). */
 	frame?: number;
 	name: string;
 }
@@ -32,13 +43,30 @@ export interface ClassifyResult {
 	ok: boolean;
 	promptName: string | null;
 	mode: "start-end" | "refs" | "prompt" | null;
-	/** Ordered file names (start, then end; or frames 1..N). */
+	/** Ordered image file names (start, then end; or numbered frame images 1..N). */
 	orderedNames: string[];
+	/** Ordered numbered-video file names (video 1..M). */
+	videoNames: string[];
+	/** Ordered numbered-audio file names (audio 1..K). */
+	audioNames: string[];
 	errors: string[];
 }
 
+// Upper bound on the total number of files a zip may carry, regardless of type.
+// Numbered files are already capped per type (9 images / 3 videos / 3 audio), so this is a belt-and-suspenders sanity cap rather than the operating limit.
 export const MAX_FILES = 20;
 export const MAX_FRAME_NUMBER = 9;
+export const MAX_REF_IMAGES = MAX_FRAME_NUMBER;
+export const MAX_REF_VIDEOS = 3;
+export const MAX_REF_AUDIOS = 3;
+export const MAX_REF_TOTAL = 12;
+// The extracted frame count to target per reference video.
+// The server normalizes the count and requires at least 5; a target a bit above the app's default frame count keeps payloads bounded while still giving the model enough frames.
+export const MAX_REF_VIDEO_FRAMES = 57;
+// Frames are downscaled to at most this width when decoded, to keep the inline-base64 request body reasonable.
+export const MAX_REF_FRAME_WIDTH = 512;
+// JPEG quality applied to decoded reference-video frames.
+export const REF_FRAME_QUALITY = 0.7;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_ZIP_BYTES = 200 * 1024 * 1024;
 // Cap on a decoded image's pixel grid (naturalWidth * naturalHeight).
@@ -46,6 +74,9 @@ export const MAX_ZIP_BYTES = 200 * 1024 * 1024;
 export const MAX_IMAGE_PIXELS = 64_000_000;
 export const MAX_PROMPT_BYTES = 64 * 1024;
 export const MAX_PROMPT_CHARS = 20000;
+
+// Min frames a reference video must yield after extraction; the server rejects anything below this.
+export const MIN_REF_VIDEO_FRAMES = 5;
 
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -68,6 +99,14 @@ export function crc32(bytes: Uint8Array): number {
 	return (c ^ 0xffffffff) >>> 0;
 }
 
+// Reference-image extensions this server decodes for `ref_images[]` / video frames.
+// The hosted-api doc narrows the safe set to PNG/JPEG/WEBP/BMP; HEIC/HEIF are not decodable here and are rejected as "other".
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "bmp"];
+// Video is never sent as a file: these extension names merely pick the container up to be decoded to an ordered frame list.
+const VIDEO_EXTS = ["mp4", "mov", "webm", "m4v"];
+// Audio is accepted in any decodable format and transcoded to WAV (WAV passes through unchanged).
+const AUDIO_EXTS = ["wav", "mp3", "m4a", "aac", "flac", "ogg"];
+
 const IMAGE_MIME: Record<string, string> = {
 	png: "image/png",
 	jpg: "image/jpeg",
@@ -76,6 +115,22 @@ const IMAGE_MIME: Record<string, string> = {
 	gif: "image/gif",
 	bmp: "image/bmp",
 	avif: "image/avif",
+};
+
+const VIDEO_MIME: Record<string, string> = {
+	mp4: "video/mp4",
+	mov: "video/quicktime",
+	webm: "video/webm",
+	m4v: "video/mp4",
+};
+
+const AUDIO_MIME: Record<string, string> = {
+	wav: "audio/wav",
+	mp3: "audio/mpeg",
+	m4a: "audio/mp4",
+	aac: "audio/aac",
+	flac: "audio/flac",
+	ogg: "audio/ogg",
 };
 
 function stemOf(name: string): string {
@@ -90,7 +145,8 @@ function extensionOf(name: string): string {
 /**
  * Classify a single file name (top-level entry names only) by case-insensitive, literal-suffix matching.
  * Returns one of the known kinds or "other" for anything unrecognized.
- * prompt is checked before start/end/frame.
+ * prompt is checked before start/end/numbered files.
+ * A numbered file's type is decided by extension; a numeric stem with an unsupported extension is "other".
  */
 export function classifyName(name: string): ClassifiedEntry {
 	const lower = name.toLowerCase();
@@ -103,10 +159,51 @@ export function classifyName(name: string): ClassifiedEntry {
 	const m = /^(.*?)(\d+)$/.exec(stemOf(name));
 	if (m) {
 		const digits = m[2];
-		const frame = digits !== undefined ? parseInt(digits, 10) : NaN;
-		return { kind: "frame", frame, name };
+		const number = digits !== undefined ? parseInt(digits, 10) : NaN;
+		const ext = extensionOf(name).replace(".", "");
+		if (IMAGE_EXTS.includes(ext)) return { kind: "frame", frame: number, name };
+		if (VIDEO_EXTS.includes(ext)) return { kind: "video", frame: number, name };
+		if (AUDIO_EXTS.includes(ext)) return { kind: "audio", frame: number, name };
+		return { kind: "other", name };
 	}
 	return { kind: "other", name };
+}
+
+/**
+ * Order and validate one numbered reference group (images / videos / audio) by case-insensitive name.
+ * Requires a contiguous, gap-free sequence from 1 up to `cap`, with no duplicate numbers.
+ * Pushes user-facing errors and returns the ordered file names.
+ */
+function orderGroup(entries: ClassifiedEntry[], kind: "frame" | "video" | "audio", cap: number, errors: string[]): string[] {
+	const byNumber = new Map<number, string>();
+	for (const c of entries) {
+		if (c.frame === undefined) continue;
+		const n = c.frame;
+		const prev = byNumber.get(n);
+		if (prev !== undefined) {
+			errors.push(`More than one ${kind} is numbered "${n}" (${prev} and ${c.name}).`);
+		} else {
+			byNumber.set(n, c.name);
+		}
+	}
+	const nums = Array.from(byNumber.keys()).sort((a, b) => a - b);
+	const count = nums.length;
+	if (count > cap) {
+		errors.push(`Up to ${cap} numbered ${kind === "frame" ? "images" : kind + "s"} are supported.`);
+	}
+	if (nums.some((n) => n > cap)) {
+		errors.push(`Numbered ${kind === "frame" ? "images" : kind + "s"} beyond ${cap} are not supported.`);
+	}
+	const expected = Array.from({ length: count }, (_, i) => i + 1);
+	if (nums.length && !expected.every((v, i) => v === nums[i])) {
+		errors.push(`Numbered ${kind === "frame" ? "images" : kind + "s"} must be sequential from 1 to ${count}. Found: ${nums.join(", ")}.`);
+	}
+	const ordered: string[] = [];
+	for (const n of expected) {
+		const name = byNumber.get(n);
+		if (name !== undefined) ordered.push(name);
+	}
+	return ordered;
 }
 
 /**
@@ -143,50 +240,36 @@ export function classifyNames(names: string[]): ClassifyResult {
 	if (startCount > 1) errors.push("The zip contains more than one start file.");
 	if (endCount > 1) errors.push("The zip contains more than one end file.");
 
+	const frames = classified.filter((c) => c.kind === "frame");
+	const videos = classified.filter((c) => c.kind === "video");
+	const audios = classified.filter((c) => c.kind === "audio");
+	const anyNumbered = frames.length > 0 || videos.length > 0 || audios.length > 0;
 	const startEndPresent = startCount > 0 || endCount > 0;
-	const numbered = classified.filter((c) => c.kind === "frame");
-	if (startEndPresent && numbered.length > 0) {
-		errors.push("The zip mixes start/end files with numbered frames; please include one or the other.");
+	if (startEndPresent && anyNumbered) {
+		errors.push("The zip mixes start/end files with numbered references; please include one or the other (references cannot be combined with start/end frames).");
+	}
+
+	const frameNames = orderGroup(frames, "frame", MAX_REF_IMAGES, errors);
+	const videoNames = orderGroup(videos, "video", MAX_REF_VIDEOS, errors);
+	const audioNames = orderGroup(audios, "audio", MAX_REF_AUDIOS, errors);
+
+	const totalRefs = frameNames.length + videoNames.length + audioNames.length;
+	if (totalRefs > MAX_REF_TOTAL) {
+		errors.push(`Too many reference files (max ${MAX_REF_TOTAL} total across images, videos and audio).`);
 	}
 
 	let orderedNames: string[] = [];
 	let mode: "start-end" | "refs" | "prompt" | null = null;
 
-	if (numbered.length > 0) {
-		const byFrame = new Map<number, string>();
-		for (const c of numbered) {
-			if (c.frame === undefined) continue;
-			const n = c.frame;
-			if (byFrame.has(n)) {
-				errors.push(`More than one file is numbered "${n}" (${byFrame.get(n)} and ${c.name}).`);
-			} else {
-				byFrame.set(n, c.name);
-			}
-		}
-		const nums = Array.from(byFrame.keys()).sort((a, b) => a - b);
-		const count = nums.length;
-		if (count > MAX_FRAME_NUMBER) {
-			errors.push(`Up to ${MAX_FRAME_NUMBER} numbered frames are supported.`);
-		}
-		const expected = Array.from({ length: count }, (_, i) => i + 1);
-		if (nums.length && !expected.every((v, i) => v === nums[i])) {
-			errors.push(`Numbered frames must be sequential from 1 to ${count}. Found: ${nums.join(", ")}.`);
-		}
-		if (nums.some((n) => n > MAX_FRAME_NUMBER)) {
-			errors.push(`Numbered frames beyond ${MAX_FRAME_NUMBER} are not supported.`);
-		}
-		orderedNames = [];
-		for (const n of expected) {
-			const name = byFrame.get(n);
-			if (name !== undefined) orderedNames.push(name);
-		}
-		mode = "refs";
-	} else if (startEndPresent) {
+	if (startEndPresent) {
 		orderedNames = [
 			...classified.filter((c) => c.kind === "start").map((c) => c.name),
 			...classified.filter((c) => c.kind === "end").map((c) => c.name),
 		];
 		mode = "start-end";
+	} else if (anyNumbered) {
+		orderedNames = frameNames;
+		mode = "refs";
 	} else if (promptNames.length === 1) {
 		mode = "prompt";
 	}
@@ -197,6 +280,8 @@ export function classifyNames(names: string[]): ClassifyResult {
 		promptName: firstPrompt !== undefined && promptNames.length === 1 ? firstPrompt : null,
 		mode: errors.length === 0 ? mode : null,
 		orderedNames,
+		videoNames,
+		audioNames,
 		errors,
 	};
 }
@@ -205,6 +290,12 @@ export function classifyNames(names: string[]): ClassifyResult {
 export function guessImageMime(name: string): string {
 	const ext = extensionOf(name).replace(".", "");
 	return IMAGE_MIME[ext] ?? "application/octet-stream";
+}
+
+/** Guess the MIME type of any media file (image, video container, or audio) from its extension. */
+export function guessMediaMime(name: string): string {
+	const ext = extensionOf(name).replace(".", "");
+	return IMAGE_MIME[ext] ?? VIDEO_MIME[ext] ?? AUDIO_MIME[ext] ?? "application/octet-stream";
 }
 
 /**
@@ -609,13 +700,56 @@ export async function analyzeZip(blob: Blob, zipName: string): Promise<ZipAnalys
 		files.push({ name, dataUrl });
 	}
 
-	// Very large frame sets would be wasteful; keep a sanity cap.
-	if (files.length > MAX_FILES) {
-		throw new Error(`Too many image files in the zip (max ${MAX_FILES}).`);
+	// Very large file sets would be wasteful; keep a sanity cap across every type.
+	if (files.length + result.videoNames.length + result.audioNames.length > MAX_FILES) {
+		throw new Error(`Too many files in the zip (max ${MAX_FILES}).`);
+	}
+
+	const videos: RefVideoFile[] = [];
+	for (const name of result.videoNames) {
+		const entry = fileEntries.find((e) => e.name === name);
+		if (!entry) continue;
+		let decoded: Uint8Array;
+		try {
+			decoded = await readEntry(bytes, entry);
+		} catch (err) {
+			throw new Error(err instanceof Error ? err.message : String(err));
+		}
+		try {
+			const container = decoded.slice();
+			const sourceDataUrl = bytesToDataUrl(decoded, guessMediaMime(name));
+			const extracted = await extractRefVideo(bytesToBlob(container, guessMediaMime(name)), MAX_REF_VIDEO_FRAMES, MAX_REF_FRAME_WIDTH, REF_FRAME_QUALITY);
+			if (extracted.frames.length < MIN_REF_VIDEO_FRAMES) {
+				throw new Error(`${name} is too short for a reference video; it needs at least ${MIN_REF_VIDEO_FRAMES} frames.`);
+			}
+			videos.push({ name, fps: extracted.fps, frames: extracted.frames, audio: extracted.audio, sourceDataUrl });
+		} catch (err) {
+			throw new Error(err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	const audios: RefAudioFile[] = [];
+	for (const name of result.audioNames) {
+		const entry = fileEntries.find((e) => e.name === name);
+		if (!entry) continue;
+		let decoded: Uint8Array;
+		try {
+			decoded = await readEntry(bytes, entry);
+		} catch (err) {
+			throw new Error(err instanceof Error ? err.message : String(err));
+		}
+		try {
+			const container = decoded.slice();
+			const sourceDataUrl = bytesToDataUrl(decoded, guessMediaMime(name));
+			const dataUrl = await transcodeAudioRef(bytesToBlob(container, guessMediaMime(name)));
+			audios.push({ name, dataUrl, sourceDataUrl });
+		} catch (err) {
+			throw new Error(err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	if (result.mode === null) {
 		throw new Error("The zip is missing a required prompt.txt file.");
 	}
-	return { prompt, mode: result.mode, files };
+	return { prompt, mode: result.mode, files, videos, audios };
 }
