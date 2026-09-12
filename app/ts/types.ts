@@ -19,7 +19,7 @@ export interface ZipFile {
 export interface RefVideoFile {
 	/** Original video file name from the zip. */
 	name: string;
-	/** Real source frame rate of the video (sent un-resampled; the server normalizes to 24 fps). */
+	/** Frame rate of the delivered frames (always 24; extraction resamples the source onto that grid). */
 	fps: number;
 	/** Ordered JPEG data URLs, one per video frame, in playback order. */
 	frames: string[];

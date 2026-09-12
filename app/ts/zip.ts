@@ -23,7 +23,7 @@
 // Any extra file, a missing prompt, conflicting input kinds, or a non-contiguous numbered group is reported as an error before the zip is accepted.
 //
 // Images are decoded to PNG/JPEG/WEBP/BMP data URLs here. Video and audio files are handed to the reference extraction worker (refExtract).
-// A video becomes an ordered frame list, its real fps, and an optional WAV soundtrack; any audio is transcoded to WAV.
+// A video becomes an ordered frame list on the 24 fps reference grid (reported as fps 24) plus an optional WAV soundtrack trimmed to the frames' span; any audio is transcoded to WAV.
 // The original container bytes are retained so a regenerated source zip reproduces the upload.
 //
 // The container format is parsed directly here using the local/central directory records; deflate entries are inflated with the native `DecompressionStream`, so no external zip library is required.
@@ -61,8 +61,9 @@ export const MAX_REF_VIDEOS = 3;
 export const MAX_REF_AUDIOS = 3;
 export const MAX_REF_TOTAL = 12;
 // The extracted frame count to target per reference video.
-// The server normalizes the count and requires at least 5; a target a bit above the app's default frame count keeps payloads bounded while still giving the model enough frames.
-export const MAX_REF_VIDEO_FRAMES = 57;
+// Extraction resamples the source onto the 24 fps reference grid and keeps at most the first 209 frames — about 8.7 seconds, and a 17k+5 grid point matching the server's reference-prefix normalization, so nothing is lost to rounding at the cap.
+// The request clamps the posted frames to the job's own frame count, and the inline payload stays bounded by MAX_REF_FRAME_WIDTH / REF_FRAME_QUALITY.
+export const MAX_REF_VIDEO_FRAMES = 209;
 // Frames are downscaled to at most this width when decoded, to keep the inline-base64 request body reasonable.
 export const MAX_REF_FRAME_WIDTH = 512;
 // JPEG quality applied to decoded reference-video frames.

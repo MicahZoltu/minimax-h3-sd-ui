@@ -111,17 +111,17 @@ describe("buildVidGenRequest", () => {
 		expect(body.init_image).toBe(null);
 	});
 
-	it("serializes reference videos with frames, real fps, and an optional soundtrack", () => {
+	it("serializes reference videos with frames, the delivered-frame fps verbatim, and an optional soundtrack", () => {
 		const item = baseItem({
 			mode: "refs",
 			videos: [
-				{ name: "clip.mp4", fps: 60, frames: ["data:a", "data:b"], audio: "data:wav", sourceDataUrl: "data:mp4" },
+				{ name: "clip.mp4", fps: 24, frames: ["data:a", "data:b"], audio: "data:wav", sourceDataUrl: "data:mp4" },
 				{ name: "silent.mp4", fps: 24, frames: ["data:c"], audio: null, sourceDataUrl: "data:mp4" },
 			],
 		});
 		const body = buildVidGenRequest(item);
 		expect(body.ref_videos).toEqual([
-			{ frames: ["data:a", "data:b"], fps: 60, audio: "data:wav" },
+			{ frames: ["data:a", "data:b"], fps: 24, audio: "data:wav" },
 			{ frames: ["data:c"], fps: 24 },
 		]);
 		expect(body.ref_audios).toEqual([]);

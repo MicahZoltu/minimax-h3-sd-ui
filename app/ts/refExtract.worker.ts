@@ -1,17 +1,19 @@
 // Web Worker entry for referencing media extraction.
 // Receives protocol messages from the main thread and derives the frame list / fps / soundtrack a video reference ingestion needs.
+// Frames are sampled onto the 24 fps reference grid planned by refExtract.plan.js, so the reported fps always describes the delivered frames exactly.
 // Mirrors the message shapes defined locally in refExtract.ts (they are not exported there).
 // Exports nothing; wiring self.onmessage on load is the whole point.
 
 import { ALL_FORMATS } from "../vendor/mediabunny/src/input-format.js";
 import { Conversion } from "../vendor/mediabunny/src/conversion.js";
-import { type FrameRateMetrics, type InputVideoTrack } from "../vendor/mediabunny/src/input-track.js";
+import { type InputVideoTrack } from "../vendor/mediabunny/src/input-track.js";
 import { Input } from "../vendor/mediabunny/src/input.js";
 import { CanvasSink, type WrappedCanvas } from "../vendor/mediabunny/src/media-sink.js";
 import { WavOutputFormat } from "../vendor/mediabunny/src/output-format.js";
 import { Output } from "../vendor/mediabunny/src/output.js";
 import { BlobSource } from "../vendor/mediabunny/src/source.js";
 import { BufferTarget } from "../vendor/mediabunny/src/target.js";
+import { REF_VIDEO_FPS, planReferenceSampling } from "./refExtract.plan.js";
 
 // The worker half of the protocol. Types are local to refExtract.ts, so they are mirrored verbatim here.
 type RefWorkerRequest =
@@ -51,18 +53,6 @@ function bufferToDataUrl(buffer: ArrayBuffer, mime: string): string {
 	return `data:${mime};base64,${btoa(chunks.join(""))}`;
 }
 
-function isPositiveFinite(value: number): boolean {
-	return Number.isFinite(value) && value > 0;
-}
-
-function pickFrameRate(metrics: FrameRateMetrics): number {
-	const candidates = [metrics.bestGuessFrameRate, metrics.averageFrameRate, metrics.medianFrameRate];
-	for (const rate of candidates) {
-		if (isPositiveFinite(rate)) return rate;
-	}
-	return 30;
-}
-
 function downscaled(trackWidth: number, trackHeight: number, maxWidth: number): { width: number; height: number } {
 	const width = Math.max(1, Math.floor(maxWidth));
 	if (trackWidth <= 0 || trackHeight <= 0) return { width, height: Math.max(1, Math.floor(maxWidth)) };
@@ -81,16 +71,14 @@ async function renderToJpeg(wrapped: WrappedCanvas, maxWidth: number, quality: n
 	return bufferToDataUrl(await blob.arrayBuffer(), "image/jpeg");
 }
 
-// Renders the video's frames as downscaled JPEG data URLs in playback order.
-// When the native frame count exceeds the target, frames are sampled evenly by taking every step-th frame in order.
-async function extractFrames(videoTrack: InputVideoTrack, target: number, maxWidth: number, quality: number, nativeCount: number, start: number, end: number): Promise<string[]> {
-	const step = nativeCount > 0 ? Math.max(1, Math.ceil(nativeCount / target)) : 1;
+// Renders one JPEG data URL per planned sample timestamp, in presentation order.
+// Each grid point shows the frame displayed at that instant, so the delivered count equals the plan's length unless the decoder falls short, and every delivered frame sits on the grid the reported fps describes.
+async function extractFrames(videoTrack: InputVideoTrack, timestamps: number[], maxWidth: number, quality: number): Promise<string[]> {
 	const sink = new CanvasSink(videoTrack);
 	const frames: string[] = [];
-	let index = 0;
-	for await (const wrapped of sink.canvases(start, end)) {
-		if (frames.length >= target) break;
-		if (index++ % step !== 0) continue;
+	for await (const wrapped of sink.canvasesAtTimestamps(timestamps)) {
+		// A null entry means the decoder fell short of the requested timestamp, or the timestamp precedes the first frame, so there is no frame to render there.
+		if (!wrapped) continue;
 		const dataUrl = await renderToJpeg(wrapped, maxWidth, quality);
 		if (dataUrl) frames.push(dataUrl);
 	}
@@ -98,8 +86,9 @@ async function extractFrames(videoTrack: InputVideoTrack, target: number, maxWid
 	return frames;
 }
 
-// Extracts the primary soundtrack of a video container as a WAV data URL, or null when it has none or cannot be decoded.
-async function extractVideoAudio(blob: Blob): Promise<string | null> {
+// Extracts the primary soundtrack of a video container as a WAV data URL trimmed to [start, end), or null when the container has no audio track.
+// The trim keeps the soundtrack within the delivered frames' span, so it can never outgrow the video prefix on the server (the server's block timeline is max(video, audio)).
+async function extractVideoAudio(blob: Blob, start: number, end: number): Promise<string | null> {
 	const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
 	try {
 		if (!(await input.canRead())) return null;
@@ -113,6 +102,7 @@ async function extractVideoAudio(blob: Blob): Promise<string | null> {
 			output,
 			audio: { codec: "pcm-s16", sampleFormat: "s16" },
 			tracks: "primary",
+			trim: { start, end },
 		});
 		if (!conversion.isValid) throw new Error("The video's soundtrack could not be decoded.");
 		await conversion.execute();
@@ -135,14 +125,15 @@ async function handleVideo(request: VideoRequest): Promise<void> {
 	try {
 		const videoTrack = await input.getPrimaryVideoTrack();
 		if (!videoTrack) throw new Error("The video has no decodable video track.");
-		const metrics = await videoTrack.computeFrameRateMetrics();
-		const fps = pickFrameRate(metrics);
+		const firstTimestamp = Math.max(0, await videoTrack.getFirstTimestamp());
+		// computeDuration returns the END timestamp of the last packet, not the container's nominal duration, so `end - firstTimestamp` is the true frame span the plan resamples onto the 24 fps grid.
 		const end = await videoTrack.computeDuration({ skipLiveWait: true });
-		const start = Math.max(0, await videoTrack.getFirstTimestamp());
-		const nativeCount = Math.round(Math.max(0, end - start) * fps);
-		const frames = await extractFrames(videoTrack, target, maxWidth, quality, nativeCount, start, end);
-		const audio = await extractVideoAudio(blob);
-		scope.postMessage({ type: "video-result", id, fps, frames, audio });
+		const plan = planReferenceSampling(firstTimestamp, end, target);
+		const frames = await extractFrames(videoTrack, plan, maxWidth, quality);
+		// The soundtrack is trimmed to the span the delivered frames cover, so its length can never outgrow the video prefix on the server (the server's block timeline is max(video, audio)).
+		// extractFrames throws before this line when nothing decoded, so `frames.length` is >= 1 here.
+		const audio = await extractVideoAudio(blob, firstTimestamp, firstTimestamp + frames.length / REF_VIDEO_FPS);
+		scope.postMessage({ type: "video-result", id, fps: REF_VIDEO_FPS, frames, audio });
 	} finally {
 		input.dispose();
 	}

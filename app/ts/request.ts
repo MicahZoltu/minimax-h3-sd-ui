@@ -111,6 +111,8 @@ export function buildVidGenRequest(item: QueueItem): VidGenRequest {
 	//
 	// A reference video is sampled up to a fixed cap at extraction time, before the form's frame count is known.
 	// Clamp the posted frames to the request's own video_frames, never dropping below the server's 5-frame minimum.
+	// Extracted frames sit on the 24 fps reference grid and the posted `fps` always describes the delivered frames exactly, so the server's 24 fps normalization is the identity and never duplicates or drops frames.
+	// The soundtrack is trimmed at extraction time to the extracted frames' span; when the form's frame count slices the posted frames below the extracted set, the posted soundtrack can outlast them, which the server absorbs by sizing the prefix block to max(video, audio).
 	const refVideos = (item.videos ?? []).map((v) => {
 		const cap = Math.max(5, Math.min(item.jobFrames, v.frames.length));
 		return { frames: v.frames.slice(0, cap), fps: v.fps, ...(v.audio !== null ? { audio: v.audio } : {}) };

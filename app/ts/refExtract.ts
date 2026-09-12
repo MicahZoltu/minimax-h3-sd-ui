@@ -1,12 +1,12 @@
 // Main-thread coordinator for the reference-media extraction worker.
 //
-// The server accepts reference video only as an ordered frame list (plus a real fps and an optional WAV soundtrack), and reference audio only as WAV.
+// The server accepts reference video only as an ordered frame list sampled at an integer fps (plus an optional WAV soundtrack), and reference audio only as WAV.
 // A raw uploaded video/audio file must therefore be decoded in the browser before it can be attached to a request.
 // This module is the thin main-thread half of that: it spawns the dedicated worker (refExtract.worker.ts), posts a single job, and resolves with the derived resources.
 // Reference ingestion is rare (one per zip upload), so a fresh worker is spawned per operation instead of maintaining a shared worker with in-flight coordination.
 
 export interface ExtractedRefVideo {
-	/** Real source frame rate of the video. */
+	/** Frame rate of the delivered frames (24 fps). */
 	fps: number;
 	/** Ordered JPEG data URLs, one per frame, in playback order. */
 	frames: string[];
@@ -71,7 +71,7 @@ function send(request: RefWorkerRequest): Promise<RefWorkerReply> {
 export async function extractRefVideo(blob: Blob, maxFrames: number, maxWidth: number, quality: number): Promise<ExtractedRefVideo> {
 	const reply = await send({ type: "video", id: nextRefId++, blob, maxFrames, maxWidth, quality });
 	if (!("type" in reply) || reply.type !== "video-result") throw new Error("Reference video decoding returned an unrecognized response.");
-	if (typeof reply.fps !== "number" || !Number.isFinite(reply.fps) || reply.fps <= 0) throw new Error("Reference video reporting an invalid frame rate.");
+	if (typeof reply.fps !== "number" || !Number.isFinite(reply.fps) || reply.fps <= 0 || !Number.isInteger(reply.fps)) throw new Error("Reference video reporting an invalid frame rate.");
 	if (!Array.isArray(reply.frames) || reply.frames.some((f) => typeof f !== "string") || reply.frames.length < 1) throw new Error("Reference video produced no decodable frames.");
 	const audio = typeof reply.audio === "string" ? reply.audio : null;
 	return { fps: reply.fps, frames: reply.frames, audio };
