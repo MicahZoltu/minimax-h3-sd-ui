@@ -1,10 +1,11 @@
-// The header: the status line, the inline API-base editor, and the storage-note readout.
+// The header: the status line, the loaded-model indicator, the inline API-base editor, and the storage-note readout.
 // It owns building the topbar, the inline URL edit field (open on click, save on Enter, cancel on Escape/blur),
 // and the transient api-error display with its auto-hide timer.
 // The storage meter's text/bar/fill elements are exposed so mount can drive the quota meter from its refresh cadence;
 // everything else the header renders stays internal. mount calls update() from its `caps` subscription.
 // This module must never import ui.js.
 
+import { modelDisplay } from "./api.js";
 import { getApiBase, getConfigurableBase } from "./config.js";
 import { h, clear } from "./dom.js";
 import { isHTMLElement, maybeElement, requiredElement } from "./list.js";
@@ -23,6 +24,7 @@ export function buildHeader(store: Store): HeaderHandle {
 		h("div", { class: "brand" }, [h("h1", {}, "Video Studio")]),
 		h("div", { class: "topbar-right" }, [
 			h("span", { class: "status warn" }, "Connecting…"),
+			h("span", { class: "model-name", "data-model-name": "" }, ""),
 			h("div", { class: "api-inline" }, [
 				h("span", { class: "api-url", "data-api-url": "", title: "Click to edit the API server URL" }, ""),
 				h("span", { class: "api-err", "data-api-err": "" }, ""),
@@ -37,12 +39,27 @@ export function buildHeader(store: Store): HeaderHandle {
 		]),
 	]);
 	const statusEl = requiredElement(el.querySelector(".status"), isHTMLElement, "status");
+	const modelNameEl = requiredElement(el.querySelector("[data-model-name]"), isHTMLElement, "model name");
 	const storageEl = requiredElement(el.querySelector(".storage-note"), isHTMLElement, "storage note");
 	const storageTextEl = requiredElement(el.querySelector("[data-storage-text]"), isHTMLElement, "storage text");
 	const storageBarEl = requiredElement(el.querySelector("[data-storage-bar]"), isHTMLElement, "storage bar");
 	const storageFillEl = requiredElement(el.querySelector("[data-storage-fill]"), isHTMLElement, "storage fill");
 	const apiUrlEl = requiredElement(el.querySelector("[data-api-url]"), isHTMLElement, "api url");
 	const apiErrEl = maybeElement(el.querySelector("[data-api-err]"), isHTMLElement);
+	// The model indicator is shown only while the server is online, which covers both online branches (the progressError warn branch and the normal ok branch): both mean the server is reachable.
+	// When offline or when the capabilities carry no usable model info, the indicator is cleared and hidden.
+	const renderModelName = (store: Store): void => {
+		const display = store.state.online && store.state.caps ? modelDisplay(store.state.caps) : null;
+		if (display) {
+			modelNameEl.textContent = display.label;
+			modelNameEl.title = display.title ?? "";
+			modelNameEl.style.display = "";
+		} else {
+			modelNameEl.textContent = "";
+			modelNameEl.title = "";
+			modelNameEl.style.display = "none";
+		}
+	};
 	const update = (store: Store): void => {
 		if (store.state.progressError) {
 			// The server is reachable but lacks the feature this UI requires; surface that clearly rather than silently degrading.
@@ -68,6 +85,7 @@ export function buildHeader(store: Store): HeaderHandle {
 			apiErrEl.className = "api-err";
 			apiErrEl.textContent = "";
 		}
+		renderModelName(store);
 		// Don't clobber an in-progress URL edit.
 		// Display the effective base (honoring a ?api= override) as the truth; the editable stored value differs only while a query override is active.
 		if (!apiUrlEl.querySelector("input")) apiUrlEl.textContent = getApiBase();

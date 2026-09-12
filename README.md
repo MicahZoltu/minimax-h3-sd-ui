@@ -20,7 +20,7 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
 
 - Upload a `.zip` containing a `prompt.txt` plus either nothing, optional `start`/`end` image files, or numbered reference files (images, and reference **video** and **audio**).
   Files are matched by suffix: the prompt is any file whose name ends with `prompt.txt`, and start/end are names like `start`/`end` or ending in `...start.`/`...end.` (any extension).
-  Numbered references are typed by extension and numbered **per type** (each starts at 1): image frames (`*1.png` … ≤ 9), video files (`*1.mp4` … ≤ 3, decoded client-side to an ordered frame list + real fps + optional WAV soundtrack), and audio clips (`*1.wav` … ≤ 3, transcoded to WAV), with at most 12 reference files total.
+  Numbered references are typed by extension and numbered **per type** (each starts at 1): image frames (`*1.png` … ≤ 9), video files (`*1.mp4` … ≤ 3, decoded client-side onto a 24 fps frame list (capped) with an optional soundtrack WAV trimmed to the frames' span), and audio clips (`*1.wav` … ≤ 3, transcoded to WAV), with at most 12 reference files total.
   All files must sit at the top level (no subfolders).
 - Set width, height, and frame count per upload.
 - A browser-side queue that runs one job at a time and auto-advances.
@@ -34,6 +34,7 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
   Everything degrades gracefully to in-memory in private browsing when storage is unavailable.
 - After a page refresh, queued items, the currently generating item, and completed history are all restored; the running job resumes by re-polling its saved server id (it degrades to a "generation lost due to page refresh" note if the server no longer has the job).
 - Storage usage is tracked visibly in the header, with controls to delete a single history item, delete the oldest `n` generations, or clear all saved history (the currently generating item cannot be deleted).
+- While the server is online, the header shows the currently loaded model checkpoint (from the capabilities endpoint's `model` field), hidden when offline or when the server reports none.
 
 The new-job form sets **width, height, frames (default 107), and steps (default 20)**.
 Remaining parameters are fixed (fps 24, cfg 1, distilled guidance 3.5) and are not shown in the UI.
@@ -72,7 +73,7 @@ Note the page may call the API cross-origin, so the serving host must send `Acce
 
 **API surface** (all under `<base>/sdcpp/v1/`):
 
-- `GET /capabilities` — prefills width/height/frames defaults and drives the online/offline indicator.
+- `GET /capabilities` — prefills width/height/frames defaults and drives the online/offline indicator; its `model` field also supplies the loaded checkpoint name for the header's model indicator (shown only while online).
 - `POST /vid_gen` — submits a video job (202 Accepted).
 - `GET /jobs/{id}` — polls a job to completion.
 - `POST /jobs/{id}/cancel` — best-effort cancel when a running item is removed.

@@ -83,6 +83,14 @@ body {
 	border-color: rgba(230, 180, 92, 0.5);
 }
 
+.model-name {
+	max-width: 22ch;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--muted);
+}
+
 .api-inline {
 	display: flex;
 	align-items: center;

@@ -155,6 +155,34 @@ export function supportsVideoProgress(caps: Capabilities): boolean {
 	return Boolean(caps.features_by_mode?.vid_gen?.progress);
 }
 
+export interface ModelDisplay {
+	label: string;
+	title: string | null;
+}
+
+// Derives the header's loaded-model readout from a capabilities payload.
+// Returns null when the payload carries no usable model info.
+//
+// The `model` fields arrive as untrusted JSON behind a loosely typed interface, so every candidate is validated at runtime: a value qualifies only when it is a string with non-whitespace content.
+// The visible label prefers `stem` (the checkpoint filename without extension), falling back to `name` and then `path`.
+// The tooltip is the full `path`, shown only when it exists and differs from the chosen label.
+export function modelDisplay(caps: Capabilities): ModelDisplay | null {
+	const model: unknown = caps.model;
+	if (model === null || typeof model !== "object") return null;
+	const stem = "stem" in model ? nonEmptyString(model.stem) : null;
+	const name = "name" in model ? nonEmptyString(model.name) : null;
+	const path = "path" in model ? nonEmptyString(model.path) : null;
+	const label = stem ?? name ?? path;
+	if (label === null) return null;
+	return { label, title: path !== null && path !== label ? path : null };
+}
+
+// Accepts only strings with non-whitespace content.
+// Whitespace-only or mistyped values return null so they fall through to the next label candidate.
+function nonEmptyString(value: unknown): string | null {
+	return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 export async function getCapabilities(): Promise<Capabilities> {
 	const payload = await request(apiUrl("/sdcpp/v1/capabilities"));
 	if (!isCapabilities(payload)) {
