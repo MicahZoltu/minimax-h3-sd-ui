@@ -6,6 +6,7 @@ import { cancelJob } from "./api.js";
 import { buildCodecModal, probeCodecSupport, type CodecSupport } from "./codecs.js";
 import { h, clear } from "./dom.js";
 import { downloadBlob } from "./download.js";
+import { setupDragReorder } from "./dragReorder.js";
 import { setupFavicon } from "./favicon.js";
 import { buildForm, handleZipFile } from "./form.js";
 import { buildHeader } from "./header.js";
@@ -118,6 +119,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to
 	// consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
 	const box = createLightbox(store, lightboxEl);
+	setupDragReorder(store, queueRowsEl);
 
 	// List videos pause once they scroll out of view so many completed items do not all decode simultaneously.
 	// Visible rows keep their native autoplay.

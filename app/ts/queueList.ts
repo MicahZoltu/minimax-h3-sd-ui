@@ -85,14 +85,19 @@ export function buildQueueRow(item: QueueItem, queuedIndex = -1, queuedCount = 0
 	}
 
 	const body: Child[] = [
-		h("div", { class: "row-head" }, [chip, h("div", { class: "row-title" }, truncate(itemTitle(item), 90))]),
+		h("div", { class: "row-head" }, [
+			// Drag handle for the queue's drag-to-reorder (dragReorder.ts); deliberately not a [data-action] arm so neither delegated dispatcher touches it.
+			...(isQueued ? [h("span", { class: "drag-handle", "aria-hidden": "true", "data-drag-handle": "", title: "Drag to reorder" }, "⠿")] : []),
+			chip,
+			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),
+		]),
 		meta,
 		...(progress ? [progress] : []),
 		promptBlock,
 	];
 	if (actions.length > 0) body.push(h("div", { class: "row-actions" }, actions));
 
-	return h("li", { class: `job-row queue ${item.status}`, "data-id": item.id, "data-sig": queueRowSignature(item, queuedIndex, queuedCount, progressOk) }, body);
+	return h("li", { class: `job-row queue ${item.status}`, "data-id": item.id, "data-sig": queueRowSignature(item, queuedIndex, queuedCount, progressOk), draggable: isQueued ? "true" : null }, body);
 }
 
 export function moveQueueItem(store: Store, id: string, delta: number): void {
