@@ -100,6 +100,28 @@ export function crc32(bytes: Uint8Array): number {
 	return (c ^ 0xffffffff) >>> 0;
 }
 
+/**
+ * Incremental CRC-32 for streams that arrive in chunks, sharing crc32()'s table.
+ * Feed each chunk to update(); digest() applies the final inversion exactly once and may be read repeatedly.
+ * The empty payload digests to 0.
+ */
+export function incrementalCrc32(): { update(bytes: Uint8Array): void; digest(): number } {
+	let c = 0xffffffff;
+	return {
+		update(bytes: Uint8Array): void {
+			for (let i = 0; i < bytes.length; i++) {
+				const b = bytes[i];
+				if (b === undefined) continue;
+				const t = CRC_TABLE[(c ^ b) & 0xff];
+				if (t !== undefined) c = t ^ (c >>> 8);
+			}
+		},
+		digest(): number {
+			return (c ^ 0xffffffff) >>> 0;
+		},
+	};
+}
+
 // Reference-image extensions this server decodes for `ref_images[]` / video frames.
 // The hosted-api doc narrows the safe set to PNG/JPEG/WEBP/BMP; HEIC/HEIF are not decodable here and are rejected as "other".
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "bmp"];
