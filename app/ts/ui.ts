@@ -3,6 +3,7 @@
 // No markup is ever built from unescaped strings, so uploaded prompts / file names are always safe.
 
 import { cancelJob } from "./api.js";
+import { createBatchDownload, type BatchDownloadHandle } from "./batchDownload.js";
 import { buildCodecModal, probeCodecSupport, type CodecSupport } from "./codecs.js";
 import { h, clear } from "./dom.js";
 import { downloadBlob } from "./download.js";
@@ -112,6 +113,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	const formEl = requiredElement(layout.querySelector("#form"), isHTMLElement, "form");
 	const queueRowsEl = requiredElement(layout.querySelector("#queueRows"), isHTMLElement, "queue rows");
 	const historyRowsEl = requiredElement(layout.querySelector("#historyRows"), isHTMLElement, "history rows");
+	const batchBarEl = requiredElement(layout.querySelector("#batchBar"), isHTMLElement, "batch bar");
 	const listEmptyEl = requiredElement(layout.querySelector("#listEmpty"), isHTMLElement, "list empty");
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
 	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
@@ -119,6 +121,8 @@ export function mount(store: Store, root: HTMLElement): void {
 	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to
 	// consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
 	const box = createLightbox(store, lightboxEl);
+	// The batch download manager is module-local the same way: mount passes the bar + history row elements, calls batch.paint() after every history reconcile, and routes the batch arms of the delegated dispatcher to it.
+	const batch = createBatchDownload(store, batchBarEl, historyRowsEl);
 	setupDragReorder(store, queueRowsEl);
 
 	// List videos pause once they scroll out of view so many completed items do not all decode simultaneously.
@@ -272,13 +276,15 @@ export function mount(store: Store, root: HTMLElement): void {
 	// A completion must add a single row and a view must remove a single highlight, without tearing down
 	// the other ~N rows (each of which embeds a large base64 thumbnail) — a full rebuild caused the post-generation studders.
 	function renderHistorySection(): void {
-		reconcileRows(historyRowsEl, buildHistoryRowSpecs(store), {
+		reconcileRows(historyRowsEl, buildHistoryRowSpecs(store, batch.selection), {
 			rowSelector: "li.job-row.history",
 			// Revoke this item's URLs only after its row left the DOM so no live media still references them.
 			onRemoved: (id) => revokeRowMedia(id),
 		});
 		observeListMedia(historyRowsEl);
 		updateListEmpty();
+		// Explicit one-line coupling: the batch bar and the rows' selection classes repaint from the manager's snapshot after every reconcile (rows are reused in place, so only this keeps their checkbox paint current).
+		batch.paint();
 	}
 
 	// Subscribe per domain so a queue/progress/resident emission never scans the history list (and vice versa).
@@ -332,7 +338,7 @@ export function mount(store: Store, root: HTMLElement): void {
 	refreshStorageMeter();
 	setInterval(() => void refreshStorageMeter(), 2000);
 
-	setupDelegated(store, app);
+	setupDelegated(store, app, batch);
 	setupFavicon(store);
 
 	// Kick off right away in case a pump needs to resume.
@@ -345,13 +351,14 @@ function buildLayout(): HTMLElement {
 		h("section", { id: "form", class: "panel form-panel", "aria-label": "New generation" }),
 		h("section", { id: "list", class: "panel list-panel", "aria-label": "Generation queue and history" }, [
 			h("ol", { id: "queueRows", class: "job-list" }),
+			h("div", { id: "batchBar", class: "batch-bar" }),
 			h("ol", { id: "historyRows", class: "job-list" }),
 			h("p", { id: "listEmpty", class: "empty" }, "Nothing here yet."),
 		]),
 	]);
 }
 
-function setupDelegated(store: Store, root: HTMLElement): void {
+function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHandle): void {
 	root.addEventListener("click", (event) => {
 		if (!(event.target instanceof HTMLElement)) return;
 		const target = maybeElement(event.target.closest("[data-action]"), isHTMLElement);
@@ -394,6 +401,34 @@ function setupDelegated(store: Store, root: HTMLElement): void {
 				break;
 			case "download-zip":
 				void downloadSourceZip(store, id);
+				break;
+			// Batch download arms: selection entry/exit + toggles, start (raw; compressed lands later), cancel, dismiss.
+			case "history-select":
+				batch.setSelecting(true);
+				break;
+			case "toggle-select":
+				if (id) batch.toggle(id);
+				break;
+			case "batch-select-all":
+				batch.selectAll();
+				break;
+			case "batch-select-none":
+				batch.clearSelection();
+				break;
+			case "batch-select-exit":
+				batch.setSelecting(false);
+				break;
+			case "batch-raw":
+				batch.start("raw");
+				break;
+			case "batch-compressed":
+				batch.start("compressed");
+				break;
+			case "batch-cancel":
+				batch.cancel();
+				break;
+			case "batch-dismiss":
+				batch.dismiss();
 				break;
 			default:
 				break;

@@ -19,6 +19,20 @@ export function attachRowThumb(store: Store, img: HTMLImageElement, id: string):
 	}).catch(() => {});
 }
 
+/** Read-only view of the batch download manager's selection, so rows can paint checkbox state without importing it. */
+export interface HistorySelectionReader {
+	isSelected(id: string): boolean;
+}
+
+// Applies the item's selection state to its row: the checkbox's checked property and the row's `selected` class.
+// Called at build time and in onKept; selection never enters historySig(), so rows never rebuild for it.
+function paintSelection(row: HTMLElement, id: string, selection?: HistorySelectionReader): void {
+	const selected = selection ? selection.isSelected(id) : false;
+	const input = row.querySelector('input[data-action="toggle-select"]');
+	if (input instanceof HTMLInputElement) input.checked = selected;
+	row.classList.toggle("selected", selected);
+}
+
 export function buildRowMedia(store: Store, item: HistoryItem, isResident: boolean, residentUrl: string | null): HTMLElement {
 	if (item.video.mime.startsWith("video/") && isResident && residentUrl) {
 		return h("video", { class: "row-media", src: residentUrl, autoplay: true, muted: true, loop: true, playsinline: true, "aria-label": item.prompt, "data-action": "view-video", "data-id": item.id });
@@ -30,10 +44,14 @@ export function buildRowMedia(store: Store, item: HistoryItem, isResident: boole
 
 // History rows always render their thumbnail (never the resident video); the resident <video> is attached in place by swapResidentMedia.
 // The resident id is attached to the <li> so the history reconcile can reuse rows by id without rebuilding them.
+// The leading .row-select label carries the batch-selection checkbox; it stays display:none until #historyRows gains `selecting`.
 export function buildHistoryRow(store: Store, item: HistoryItem): HTMLElement {
 	const media = buildRowMedia(store, item, false, null);
 
 	return h("li", { class: item.viewed ? "job-row history" : "job-row history new", "data-id": item.id }, [
+		h("label", { class: "row-select" }, [
+			h("input", { type: "checkbox", "data-action": "toggle-select", "data-id": item.id, "aria-label": `Select ${itemTitle(item)}` }),
+		]),
 		media,
 		h("div", { class: "row-body" }, [
 			h("div", { class: "row-title" }, truncate(itemTitle(item), 90)),
@@ -63,15 +81,22 @@ export function buildHistoryRow(store: Store, item: HistoryItem): HTMLElement {
 	]);
 }
 
-// A history row's lazy reconcile spec: an existing row is always reused in place (so its open <details> and the
-// attached resident swap survive), only the "new" highlight is toggled, and a missing row is freshly built.
-export function buildHistoryRowSpecs(store: Store): ReconcileRowSpec[] {
+// A history row's lazy reconcile spec: an existing row is always reused in place (so its open <details> and the attached resident swap survive), only the "new" highlight and the selection paint are toggled, and a missing row is freshly built.
+// The optional selection reader comes from the batch download manager; rows paint checkbox state from it without the batch state ever entering historySig().
+export function buildHistoryRowSpecs(store: Store, selection?: HistorySelectionReader): ReconcileRowSpec[] {
 	const items = [...store.history.items()].reverse();
 	return items.map((item) => ({
 		id: item.id,
 		isSame: () => true,
-		build: () => buildHistoryRow(store, item),
-		onKept: (row) => row.classList.toggle("new", !item.viewed),
+		build: () => {
+			const row = buildHistoryRow(store, item);
+			paintSelection(row, item.id, selection);
+			return row;
+		},
+		onKept: (row) => {
+			row.classList.toggle("new", !item.viewed);
+			paintSelection(row, item.id, selection);
+		},
 	}));
 }
 

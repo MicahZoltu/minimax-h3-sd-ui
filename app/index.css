@@ -669,6 +669,54 @@ button.badge {
 	text-align: center;
 }
 
+/* ---- batch download bar (history multi-select) ---- */
+#batchBar {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-top: 10px;
+}
+
+.batch-summary {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 13px;
+	color: var(--muted);
+}
+
+.batch-fail {
+	flex: 1 1 100%;
+	font-size: 12px;
+	color: var(--bad);
+	word-break: break-word;
+}
+
+.row-select {
+	display: none;
+	align-self: center;
+	flex-shrink: 0;
+}
+
+.row-select input {
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+
+#historyRows.selecting .row-select {
+	display: flex;
+}
+
+.job-row.history.selected {
+	border-color: var(--accent);
+}
+
+.batch-bar .progress-track {
+	flex: 1 1 auto;
+}
+
 /* ---- overlay / detail ---- */
 .overlay {
 	position: fixed;
