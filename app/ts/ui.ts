@@ -118,11 +118,13 @@ export function mount(store: Store, root: HTMLElement): void {
 	const lightboxEl = requiredElement(app.querySelector("#lightbox-root"), isHTMLElement, "lightbox");
 	const storageRootEl = requiredElement(app.querySelector("#storage-root"), isHTMLElement, "storage root");
 	const codecRootEl = requiredElement(app.querySelector("#codec-root"), isHTMLElement, "codec root");
-	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to
-	// consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
-	const box = createLightbox(store, lightboxEl);
 	// The batch download manager is module-local the same way: mount passes the bar + history row elements, calls batch.paint() after every history reconcile, and routes the batch arms of the delegated dispatcher to it.
-	const batch = createBatchDownload(store, batchBarEl, historyRowsEl);
+	// The compressionBlocked port closes the mutual exclusion in this direction: a running lightbox compression refuses a compressed batch start, with the wording owned here.
+	// The swapped creation order is deliberate and safe: each callback dereferences the other handle lazily at invocation time, never during mount.
+	const batch = createBatchDownload(store, batchBarEl, historyRowsEl, { compressionBlocked: () => (box.compressionActive() ? "A compression is already running in the viewer." : null) });
+	// The lightbox owns its own open/close state, compression run, and delegated dispatch; mount keeps the handle to consult isOpen() from the resident mouseover guard and to re-route the lightbox-owned dispatch arms to it.
+	// compressionBlocked is load-bearing, not cosmetic: it gates BOTH the lightbox probe and the convert start, because an un-gated probe would interleave between the batch's items (serializing the batch behind it), could self-kill on its watchdog while a large blob clones into the worker (a spurious plan-null in the lightbox), and an un-gated convert could legally grab the worker slot between batch items.
+	const box = createLightbox(store, lightboxEl, { compressionBlocked: () => (batch.snapshot().phase === "running" && batch.snapshot().variant === "compressed" ? "A batch download is running." : null) });
 	setupDragReorder(store, queueRowsEl);
 
 	// List videos pause once they scroll out of view so many completed items do not all decode simultaneously.

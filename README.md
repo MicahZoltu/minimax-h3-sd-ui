@@ -30,6 +30,9 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
   Failed/cancelled items and completed history rows are not reorderable.
   Each item's prompt and input images are viewable.
 - Completed history items show elapsed time, final frame count, and dimensions; each opens a detail view to download the video, the regenerated source zip, and the input files.
+- Batch-download history: multi-select completed items and download them all as one zip — raw, or compressed per-item with the same settings as the lightbox's Download Compressed button.
+  Items process sequentially in the background behind a progress/cancel bar; isolated failures (missing data, unsupported formats, failed converts) are skipped and reported, and the browser's save dialog fires exactly once at the very end.
+  The compressor is exclusive: a running batch gates the lightbox's probe and convert, and a running lightbox compression refuses a compressed batch start.
 - The queue, in-progress generation, and completed history (including full video + input-file data) persist to **IndexedDB**, which has far larger quota than the ~5 MB `localStorage` cap (a single webm routinely exceeds it, which is why history used to vanish on refresh).
   Everything degrades gracefully to in-memory in private browsing when storage is unavailable.
 - After a page refresh, queued items, the currently generating item, and completed history are all restored; the running job resumes by re-polling its saved server id (it degrades to a "generation lost due to page refresh" note if the server no longer has the job).

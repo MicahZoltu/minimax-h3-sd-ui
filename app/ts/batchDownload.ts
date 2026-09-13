@@ -1,13 +1,13 @@
 // Batch download: a multi-selection of history videos is zipped into one archive and handed to the browser as a single download.
 // The manager owns module-local transient state (selection, run phase, progress snapshot) exactly like the lightbox owns its open/close state — no store domain, no persistence: a refresh abandoning a running batch is correct, because blobs are never lost, only the download action.
 //
-// Two variants exist: "raw" zips the stored videos as-is, and "compressed" will run each item through the transcode worker first (a follow-up change; its button renders disabled until then).
+// Two variants exist: "raw" zips the stored videos as-is, and "compressed" probes then re-encodes each item through the transcode worker before zipping (a missing blob, an unsupported probe, a failed convert, or a watchdog kill skips the item; only a user cancel or a zip-capacity violation aborts the batch).
 //
 // Every side effect rides on BatchPorts so the pipeline is bun-testable: the default wiring points at the real store / compression / download modules, and tests inject fakes.
 // The DOM surface is small and isolated in paint(), which repaints the bar from the snapshot and sweeps the history rows' selection classes.
 // The two elements are optional — the browser always passes real elements, while headless bun tests pass null and exercise only the orchestration state machine.
 
-import { probeCompression, runCompression, type CompressionRun } from "./compression.js";
+import { CompressionCanceledError, probeCompression, runCompression, type CompressionResult, type CompressionRun } from "./compression.js";
 import type { CompressionPlan, UnsupportedReason } from "./compression.types.js";
 import { clear, h } from "./dom.js";
 import { downloadBlob } from "./download.js";
@@ -27,8 +27,10 @@ export interface BatchPorts {
 	run(blob: Blob, plan: CompressionPlan, opts: { quality: "medium"; stem: string }): CompressionRun;
 	download(blob: Blob, filename: string): void;
 	now(): number;
-	/** Creates the archive writer; optional so tests can stall finish() to pin cancel-during-packing. */
+	/** Creates the archive writer; optional so tests can stall finish() or add() to pin cancel/capacity aborts. */
 	createWriter?(): ZipStreamWriter;
+	/** Non-null reason while a compression outside this manager (the lightbox) owns the worker; a compressed start refuses with it. */
+	compressionBlocked?(): string | null;
 }
 
 export interface BatchFailure {
@@ -88,14 +90,17 @@ interface BatchEntry {
 	format: string;
 }
 
-export function createBatchDownload(store: Store, barEl: HTMLElement | null, rowsEl: HTMLElement | null, ports?: BatchPorts): BatchDownloadHandle {
-	const io: BatchPorts = ports ?? {
-		loadVideo: (id) => store.history.loadVideo(id),
-		// The probe/run defaults are wired for the compressed variant landing in the follow-up change; the raw pipeline never calls them.
-		probe: (blob) => probeCompression(blob),
-		run: (blob, plan, opts) => runCompression(blob, plan, opts),
-		download: (blob, filename) => downloadBlob(blob, filename),
-		now: () => Date.now(),
+// Every member can be overridden individually (ui.ts injects only the lightbox mutex; tests inject full fakes).
+export function createBatchDownload(store: Store, barEl: HTMLElement | null, rowsEl: HTMLElement | null, ports?: Partial<BatchPorts>): BatchDownloadHandle {
+	const io: BatchPorts = {
+		loadVideo: ports?.loadVideo ?? ((id) => store.history.loadVideo(id)),
+		// The defaults wire the real compression coordinator; the raw pipeline never calls probe/run.
+		probe: ports?.probe ?? ((blob) => probeCompression(blob)),
+		run: ports?.run ?? ((blob, plan, opts) => runCompression(blob, plan, opts)),
+		download: ports?.download ?? ((blob, filename) => downloadBlob(blob, filename)),
+		now: ports?.now ?? (() => Date.now()),
+		...(ports?.createWriter ? { createWriter: ports.createWriter } : {}),
+		...(ports?.compressionBlocked ? { compressionBlocked: ports.compressionBlocked } : {}),
 	};
 	const createWriter = io.createWriter ?? ((): ZipStreamWriter => new ZipStreamWriter());
 
@@ -112,6 +117,7 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 	let zipName: string | null = null;
 	let failures: BatchFailure[] = [];
 	let cancelRequested = false;
+	let currentRun: CompressionRun | null = null;
 	let ticker: ReturnType<typeof setInterval> | null = null;
 
 	// Prune selection of ids that no longer exist on every history emission; a fully emptied history (clear / remove-all) additionally exits selecting mode.
@@ -131,11 +137,13 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 		}
 	};
 
-	// Settles the run: stops the 1 s repaint ticker and paints the final surface.
+	// Settles the run: stops the 1 s repaint ticker, drops the in-flight run reference, and paints the final surface.
+	// Nulling currentRun here means a stale settled run can never be cancelled/terminated later.
 	const settle = (next: BatchPhase): void => {
 		phase = next;
 		currentTitle = null;
 		currentPct = null;
+		currentRun = null;
 		stopTicker();
 		paint();
 	};
@@ -143,7 +151,33 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 	const recordSkip = (title: string, reason: string): void => {
 		failures.push({ title, reason });
 		skipped += 1;
+		// A skipped item no longer contributes progress to the blended bar.
+		currentPct = null;
 		paint();
+	};
+
+	// Shared pipeline tail: assemble the zip and hand it to the browser exactly once.
+	// A cancel landing during the (potentially slow) packing must not download the finished archive.
+	const packAndDeliver = async (writer: ZipStreamWriter): Promise<void> => {
+		// Zero successful entries: nothing to download; the collected skip reasons are the failure list.
+		if (writer.entryCount === 0) {
+			settle("failed");
+			return;
+		}
+		phase = "packing";
+		paint();
+		try {
+			const zip = await writer.finish();
+			if (cancelRequested) {
+				settle("canceled");
+				return;
+			}
+			io.download(zip, zipName ?? "videos.zip");
+			settle("done");
+		} catch (err) {
+			failures.push({ title: zipName ?? "zip", reason: err instanceof Error ? err.message : String(err) });
+			settle("failed");
+		}
 	};
 
 	// The raw pipeline: loadVideo → zipWriter.add → finish → download exactly once.
@@ -190,32 +224,119 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 			settle("canceled");
 			return;
 		}
-		// Zero successful entries: nothing to download; the collected skip reasons are the failure list.
-		if (writer.entryCount === 0) {
-			settle("failed");
-			return;
-		}
-		phase = "packing";
-		paint();
-		try {
-			const zip = await writer.finish();
-			// A cancel landing during the (potentially slow) packing must not download the finished archive.
+		await packAndDeliver(writer);
+	};
+
+	// The compressed pipeline: loadVideo → probe → run → collect, per item, strictly sequentially.
+	// Isolation: a missing blob, an unsupported or failed probe, a failed convert, or a watchdog kill skips the item; only a user cancel or a zip-capacity violation aborts the whole batch.
+	const runCompressed = async (entries: BatchEntry[]): Promise<void> => {
+		const writer = createWriter();
+		const used = new Set<string>();
+		for (const entry of entries) {
 			if (cancelRequested) {
 				settle("canceled");
 				return;
 			}
-			io.download(zip, zipName ?? "videos.zip");
-			settle("done");
-		} catch (err) {
-			failures.push({ title: zipName ?? "zip", reason: err instanceof Error ? err.message : String(err) });
-			settle("failed");
+			currentTitle = entry.title;
+			currentPct = null;
+			let blob: Blob | null = null;
+			try {
+				blob = await io.loadVideo(entry.id);
+			} catch {
+				blob = null;
+			}
+			// A cancel landing during the awaited load must not keep processing the just-loaded blob.
+			if (cancelRequested) {
+				settle("canceled");
+				return;
+			}
+			if (!blob) {
+				recordSkip(entry.title, "video data unavailable");
+				continue;
+			}
+			// The probe decides the plan; a probe error is an isolated skip, never a batch abort.
+			let plan: CompressionPlan | null = null;
+			let reason = "compression probe failed";
+			try {
+				const outcome = await io.probe(blob);
+				plan = outcome.plan;
+				if (outcome.plan === null && outcome.reason !== null) reason = outcome.reason;
+			} catch {
+				plan = null;
+			}
+			if (cancelRequested) {
+				settle("canceled");
+				return;
+			}
+			if (plan === null) {
+				recordSkip(entry.title, reason);
+				continue;
+			}
+			const run = io.run(blob, plan, { quality: "medium", stem: entry.stem });
+			currentRun = run;
+			// onProgress only mutates the snapshot; the 1 s ticker paints.
+			run.onProgress((pct) => {
+				currentPct = pct;
+			});
+			let result: CompressionResult;
+			try {
+				result = await run.done;
+			} catch (err) {
+				currentRun = null;
+				// The cancelRequested flag, not the error source, separates a user cancel (abort) from a watchdog kill (skip), mirroring the lightbox's typed-sentinel discipline.
+				if (err instanceof CompressionCanceledError) {
+					if (cancelRequested) {
+						settle("canceled");
+						return;
+					}
+					recordSkip(entry.title, "compression stalled");
+					continue;
+				}
+				recordSkip(entry.title, err instanceof Error ? err.message : String(err));
+				continue;
+			}
+			// The convert resolved but a cancel was requested meanwhile — the result is dropped and the batch aborts.
+			if (cancelRequested) {
+				settle("canceled");
+				return;
+			}
+			currentRun = null;
+			// The worker's result.filename is ignored: the zip entry name is assigned here, with the plan's extension.
+			const name = uniqueEntryName(entry.stem, plan.extension, used);
+			try {
+				await writer.add({ name, blob: result.blob });
+			} catch (err) {
+				// A zip-capacity violation means the archive cannot be completed as spec'd — abort the whole batch and surface the reason.
+				failures.push({ title: entry.title, reason: err instanceof Error ? err.message : String(err) });
+				settle("failed");
+				return;
+			}
+			done += 1;
+			currentTitle = null;
+			currentPct = null;
+			paint();
 		}
+		if (cancelRequested) {
+			settle("canceled");
+			return;
+		}
+		await packAndDeliver(writer);
 	};
 
 	const start = (nextVariant: BatchVariant): void => {
 		if (phase === "running" || phase === "packing") return;
-		// The compressed pipeline lands in the follow-up change; until then the runner refuses to start it.
-		if (nextVariant === "compressed") return;
+		if (nextVariant === "compressed") {
+			// A running lightbox compression owns the worker; the batch cannot start until it settles (the bar shows the port's reason).
+			const blocked = io.compressionBlocked?.() ?? null;
+			if (blocked !== null) {
+				failures.push({ title: "Batch download", reason: blocked });
+				// No zip is made, so a prior settled run's zip name must not linger in the snapshot.
+				zipName = null;
+				phase = "failed";
+				paint();
+				return;
+			}
+		}
 		// Snapshot the selection once, in display order (newest-first), so titles and entry names stay stable when items are removed mid-batch.
 		const selected = [...store.history.items()].reverse().filter((i) => selection.has(i.id));
 		if (selected.length === 0) return;
@@ -251,7 +372,8 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 		stopTicker();
 		ticker = setInterval(paint, 1000);
 		paint();
-		void runRaw(entries);
+		if (nextVariant === "raw") void runRaw(entries);
+		else void runCompressed(entries);
 	};
 
 	// Full idempotent repaint: the bar is rebuilt from the snapshot and the history rows' selection classes are swept.
@@ -277,17 +399,17 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 			barEl.appendChild(h("button", { class: "btn small", "data-action": "batch-select-none" }, "None"));
 			barEl.appendChild(h("button", { class: "btn small", "data-action": "batch-select-exit" }, "Exit"));
 			barEl.appendChild(h("button", { class: "btn small primary", "data-action": "batch-raw", title: "Zip the selected videos as-is" }, "Download raw"));
-			// The compressed pipeline lands in the follow-up change; the button renders disabled rather than starting a half-built run.
-			barEl.appendChild(h("button", { class: "btn small primary", "data-action": "batch-compressed", disabled: true, title: "Compressed batch download arrives in a later update" }, "Download compressed"));
+			barEl.appendChild(h("button", { class: "btn small primary", "data-action": "batch-compressed", title: "Compress each selected video, then zip the results" }, "Download compressed"));
 		} else if (phase === "running" || phase === "packing") {
 			barEl.style.display = "";
 			const fill = h("div", { class: "progress-fill" });
-			// Raw progress is done/total; the compressed variant will blend the in-flight item's reported percent when it lands.
-			const fraction = total > 0 ? Math.min(1, done / total) : 0;
+			// Compressed blends the in-flight item's reported percent into the bar; raw has no per-item percent, so its fill moves only at item granularity.
+			const blended = variant === "compressed" ? done + (currentPct ?? 0) : done;
+			const fraction = total > 0 ? Math.min(1, blended / total) : 0;
 			fill.style.width = `${Math.round(fraction * 100)}%`;
 			const parts: string[] = [`${done} / ${total}`];
 			if (skipped > 0) parts.push(`${skipped} skipped`);
-			parts.push(phase === "packing" ? "Packing zip…" : currentTitle !== null ? `Reading ${currentTitle}…` : "Reading…");
+			parts.push(phase === "packing" ? "Packing zip…" : variant === "compressed" ? (currentTitle !== null ? `Compressing ${currentTitle}…` : "Compressing…") : currentTitle !== null ? `Reading ${currentTitle}…` : "Reading…");
 			barEl.appendChild(h("span", { class: "batch-summary" }, parts.join(" · ")));
 			barEl.appendChild(h("div", { class: "progress-track" }, [fill]));
 			barEl.appendChild(h("button", { class: "btn small", "data-action": "batch-cancel" }, "Cancel"));
@@ -343,6 +465,8 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 		cancel: () => {
 			if (phase !== "running" && phase !== "packing") return;
 			cancelRequested = true;
+			// An in-flight convert is terminated so its CompressionCanceledError takes the cancel path immediately; a raw batch has no run and just stops the loop.
+			currentRun?.cancel();
 		},
 		dismiss: () => {
 			stopTicker();

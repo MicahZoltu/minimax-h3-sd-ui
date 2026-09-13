@@ -24,6 +24,8 @@ export interface LightboxActionContext {
 export interface LightboxHandle {
 	/** True while any lightbox (image or video) is open; mount's mouseover resident guard consults this. */
 	isOpen(): boolean;
+	/** True while a compression run is in flight from the lightbox; the batch manager's start refusal consults this. */
+	compressionActive(): boolean;
 	/** Route a delegated [data-action] click that this module owns (the non-storage lightbox arms). */
 	handleAction(action: string, ctx: LightboxActionContext): void;
 	/** Close the lightbox, refused while a compression runs; the backdrop-click guard calls this. */
@@ -44,7 +46,10 @@ interface LightboxState {
 	refUrl?: string;
 }
 
-export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxHandle {
+export function createLightbox(store: Store, lightboxEl: HTMLElement, opts?: { compressionBlocked?(): string | null }): LightboxHandle {
+	// Non-null while a batch download owns the compressor.
+	// The gate is load-bearing, not cosmetic: an un-gated probe interleaves between the batch's items (serializing the batch behind it), can self-kill on a slow structured-clone of a large blob (leaving the lightbox a spurious plan-null), and without the click-gate a lightbox convert could legally grab the worker slot between batch items.
+	const blockedReason = (): string | null => (opts?.compressionBlocked ? opts.compressionBlocked() : null);
 	let lightbox: LightboxState | null = null;
 	const renderLightbox = (): void => {
 		clear(lightboxEl);
@@ -60,9 +65,11 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 		if (hasDownload) barChildren.push(h("button", { class: "btn primary", "data-action": "download-lightbox" }, "Download"));
 		if (lb.kind === "video") {
 			const plan = lb.plan;
-			const ready = plan !== null;
-			// Informational tooltip: the plan label once a probe resolves, or a helpful note while disabled/unavailable.
-			const title = plan !== null ? planLabel(plan) : "Compression not available in this browser";
+			const blocked = blockedReason();
+			// The button is disabled while a batch download owns the compressor, with the reason as its tooltip.
+			const ready = plan !== null && blocked === null;
+			// Informational tooltip: the block reason wins even before a probe resolves, then the plan label once a probe resolves, else a helpful note while disabled/unavailable.
+			const title = blocked ?? (plan !== null ? planLabel(plan) : "Compression not available in this browser");
 			barChildren.push(
 				h("button", { class: "btn", "data-action": "download-compressed", disabled: !ready, title: title }, "Download Compressed"),
 			);
@@ -270,7 +277,8 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 				disposeState(lightbox);
 				lightbox = { kind: "video", src, filename, stem, plan: null, reason: null };
 				renderLightbox();
-				void probeVideoCompression(store, lightbox);
+				// The probe is skipped entirely while a batch compression owns the worker (see blockedReason).
+				if (blockedReason() === null) void probeVideoCompression(store, lightbox);
 			}
 		})();
 	};
@@ -364,6 +372,7 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 	};
 	return {
 		isOpen: (): boolean => lightbox !== null,
+		compressionActive: (): boolean => activeCompression !== null,
 		handleBackdropClose: (): void => {
 			// Clicking the overlay backdrop closes the lightbox, unless a compression is running (dismissal is locked for its duration).
 			if (activeCompression) return;
@@ -383,10 +392,14 @@ export function createLightbox(store: Store, lightboxEl: HTMLElement): LightboxH
 				case "view-ref-audio":
 					openRefAudio(ctx);
 					break;
-				case "download-compressed":
+				case "download-compressed": {
 					ctx.event.stopPropagation();
-					void runCompressionFromLightbox(store);
+					const blocked = blockedReason();
+					// A blocked compressor surfaces the reason as a transient message instead of starting a competing run.
+					if (blocked !== null) showTransientError(blocked);
+					else void runCompressionFromLightbox(store);
 					break;
+				}
 				case "cancel-compression":
 					ctx.event.stopPropagation();
 					cancelCompressionFromLightbox();
