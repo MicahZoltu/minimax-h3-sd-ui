@@ -130,6 +130,25 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 		if (live.size === 0) selecting = false;
 	}, ["history"]);
 
+	const toggleSelection = (id: string): void => {
+		if (selection.has(id)) selection.delete(id);
+		else selection.add(id);
+		paint();
+	};
+
+	// In select mode a click anywhere on a row's own background toggles that row, so the checkbox need not be the click target.
+	// The row's actionable elements keep their own behavior: anything carrying a data-action (media, download/delete buttons, the checkbox itself) is left to the delegated dispatcher, its label fringe is excluded so a fringe click does not double-toggle through the label's synthetic input click, and the prompt block toggles open natively.
+	if (rowsEl) {
+		rowsEl.addEventListener("click", (event) => {
+			if (!selecting) return;
+			if (!(event.target instanceof Element)) return;
+			if (event.target.closest("[data-action], .row-select") || event.target.closest(".prompt-block")) return;
+			const row = event.target.closest("li.job-row.history");
+			const id = row instanceof HTMLElement ? row.getAttribute("data-id") : null;
+			if (id !== null) toggleSelection(id);
+		});
+	}
+
 	const stopTicker = (): void => {
 		if (ticker != null) {
 			clearInterval(ticker);
@@ -443,11 +462,7 @@ export function createBatchDownload(store: Store, barEl: HTMLElement | null, row
 			ids: () => [...selection],
 		},
 		snapshot: () => ({ phase, variant, total, done, skipped, currentTitle, currentPct, zipName, failures: [...failures] }),
-		toggle: (id) => {
-			if (selection.has(id)) selection.delete(id);
-			else selection.add(id);
-			paint();
-		},
+		toggle: (id) => toggleSelection(id),
 		selectAll: () => {
 			for (const item of store.history.items()) selection.add(item.id);
 			paint();
