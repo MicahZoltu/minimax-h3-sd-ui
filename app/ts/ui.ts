@@ -9,7 +9,7 @@ import { h, clear } from "./dom.js";
 import { downloadBlob } from "./download.js";
 import { setupDragReorder } from "./dragReorder.js";
 import { setupFavicon } from "./favicon.js";
-import { buildForm, handleZipFile } from "./form.js";
+import { buildForm, handleZipFiles } from "./form.js";
 import { buildHeader } from "./header.js";
 import { formatBytes, frameDurationLabel } from "./format.js";
 import { buildHistoryRowSpecs, buildRowMedia } from "./historyList.js";
@@ -19,10 +19,9 @@ import { isHTMLElement, isInputElement, isVideoElement, maybeElement, reconcileR
 import { getOrCreate, revokeRowMedia } from "./objectUrl.js";
 import { pump } from "./queue.js";
 import { buildQueueRowSpecs, moveQueueItem, updateLive } from "./queueList.js";
+import { dimsError, queueItemFromAnalysis, type QueueDims } from "./queueItem.js";
 import type { Store } from "./state.js";
 import { buildStorageModal } from "./storage.js";
-import type { QueueItem } from "./types.js";
-import { uid } from "./utils.js";
 import { buildSourceZip } from "./zip.js";
 
 // History details that are loading (or loaded) their file thumbs, so a quick close/re-open does not double-load.
@@ -527,25 +526,28 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 		},
 		true,
 	);
+	// Dropping zip(s) onto the drop zone (capture so re-rendered zones work).
+	// Every drop routes through the multi-file intake, so a lone file keeps the single-zip preview flow.
 	root.addEventListener(
 		"drop",
 		(event) => {
 			const target = event.target;
 			if (!(target instanceof HTMLElement) || !target.closest(".dropzone")) return;
 			event.preventDefault();
-			const file = event.dataTransfer?.files?.[0];
-			if (file) void handleZipFile(store, file);
+			const dropped = event.dataTransfer?.files;
+			if (dropped && dropped.length > 0) void handleZipFiles(store, Array.from(dropped));
 		},
 		true,
 	);
 
 	// Read picked files (change bubbles from the hidden input).
+	// Every selection routes through the multi-file intake, so a lone file keeps the single-zip preview flow.
 	root.addEventListener("change", (event) => {
 		const target = maybeElement(event.target, isInputElement);
 		if (!target || target.id !== "zipFile") return;
-		const file = target.files && target.files[0];
+		const picked = target.files ? Array.from(target.files) : [];
 		target.value = "";
-		if (file) void handleZipFile(store, file);
+		if (picked.length > 0) void handleZipFiles(store, picked);
 	});
 
 	// Keep dimension inputs in sync with state without re-rendering the form (re-rendering on every keystroke would steal focus).
@@ -569,45 +571,18 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 function addToQueue(store: Store): void {
 	const f = store.state.form;
 	const analysis = f.analysis;
-	const width = Number(f.width);
-	const height = Number(f.height);
-	const frames = Number(f.frames);
-	const steps = Number(f.steps);
 	if (!analysis) {
 		store.setForm({ error: "Upload a .zip first." });
 		return;
 	}
-	if (!Number.isFinite(frames) || frames < 1) {
-		store.setForm({ error: "Frames must be at least 1." });
+	// The Number() wrap mirrors the historical read, and the shared validator keeps its exact messages and check order.
+	const dims: QueueDims = { width: Number(f.width), height: Number(f.height), frames: Number(f.frames), steps: Number(f.steps) };
+	const problem = dimsError(dims);
+	if (problem) {
+		store.setForm({ error: problem });
 		return;
 	}
-	if (!Number.isFinite(steps) || steps < 1) {
-		store.setForm({ error: "Steps must be at least 1." });
-		return;
-	}
-	if (!Number.isFinite(width) || width < 1 || !Number.isFinite(height) || height < 1) {
-		store.setForm({ error: "Width and height must be positive numbers." });
-		return;
-	}
-
-	const item: QueueItem = {
-		id: uid("q_"),
-		status: "queued",
-		prompt: analysis.prompt,
-		zipName: f.zipName,
-		mode: analysis.mode,
-		files: analysis.files,
-		videos: analysis.videos,
-		audios: analysis.audios,
-		width,
-		height,
-		jobFrames: frames,
-		steps,
-		error: null,
-		serverId: null,
-		startedAt: null,
-	};
-	store.pushQueue(item);
+	store.pushQueue(queueItemFromAnalysis(analysis, dims, f.zipName));
 	store.setForm({ analysis: null, zipName: null, error: null });
 	void pump(store);
 }

@@ -22,6 +22,9 @@ The server's HTTP API is unchanged; only where the page points its HTTP calls ch
   Files are matched by suffix: the prompt is any file whose name ends with `prompt.txt`, and start/end are names like `start`/`end` or ending in `...start.`/`...end.` (any extension).
   Numbered references are typed by extension and numbered **per type** (each starts at 1): image frames (`*1.png` … ≤ 9), video files (`*1.mp4` … ≤ 3, decoded client-side onto a 24 fps frame list (capped) with an optional soundtrack WAV trimmed to the frames' span), and audio clips (`*1.wav` … ≤ 3, transcoded to WAV), with at most 12 reference files total.
   All files must sit at the top level (no subfolders).
+- Pick or drop **many zips at once** to queue them all in one action, sharing the form's current width/height/frames/steps.
+  A multi-selection skips the preview and queues every valid zip immediately; per-file failures are reported as a single form error line while the valid zips still queue.
+  Selecting or dropping exactly one zip keeps the existing parse-preview-then-add flow unchanged.
 - Set width, height, and frame count per upload.
 - A browser-side queue that runs one job at a time and auto-advances.
   Queue and history appear as one continuous list: queued items newest-first on top, the running item pinned just above history, and completed videos newest-first below.

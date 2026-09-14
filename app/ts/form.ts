@@ -1,10 +1,16 @@
 // The new-job form DOM builder and the .zip intake that fills it.
 // Both take the store as input and neither reaches into any mount-closure transient state.
+//
+// The intake has two entry points.
+// handleZipFile keeps the single-zip preview flow; handleZipFiles routes every pick/drop through the multi-zip batch, where a lone file delegates to the single-zip flow unchanged.
 
 import { h, type Child } from "./dom.js";
 import { frameDurationLabel, truncate } from "./format.js";
+import { pump } from "./queue.js";
 import { FALLBACK_DIMS, type Store } from "./state.js";
+import type { QueueItem } from "./types.js";
 import { analyzeZip } from "./zip.js";
+import { dimsError, queueItemFromAnalysis, summarizeZipBatch, type QueueDims, type ZipBatchFailure } from "./queueItem.js";
 
 export function buildForm(store: Store): HTMLElement {
 	const f = store.state.form;
@@ -53,7 +59,7 @@ export function buildForm(store: Store): HTMLElement {
 	return h("div", { class: "inner" }, [
 		h("h2", {}, "New generation"),
 		h("div", { class: `dropzone ${f.parsing ? "busy" : ""}`, title: f.analysis ? (f.zipName ?? "zip loaded") : "Drop a .zip here or click to choose" }, [
-			h("input", { id: "zipFile", type: "file", accept: ".zip,application/x-zip-compressed,application/zip", class: "hidden" }),
+			h("input", { id: "zipFile", type: "file", accept: ".zip,application/x-zip-compressed,application/zip", class: "hidden", multiple: true }),
 			h("div", { class: "dropzone-inner" }, [
 				h("p", { class: "dz-title" }, f.analysis ? "Zip loaded" : "Drop a .zip here"),
 				h("p", { class: "dz-sub" }, f.parsing ? "Reading zip…" : "or click to browse"),
@@ -96,7 +102,7 @@ export function dimField(label: string, name: string, value: number, aria: strin
 	]);
 }
 
-export async function handleZipFile(store: Store, file: File): Promise<void> {
+async function handleZipFile(store: Store, file: File): Promise<void> {
 	store.setForm({ parsing: true, error: null });
 	try {
 		const analysis = await analyzeZip(file, file.name);
@@ -113,4 +119,60 @@ export async function handleZipFile(store: Store, file: File): Promise<void> {
 	} catch (err) {
 		store.setForm({ parsing: false, error: err instanceof Error ? err.message : String(err) });
 	}
+}
+
+/**
+ * Intake for every picked or dropped zip selection.
+ * A selection arriving while another intake is still parsing is ignored, so two in-flight intakes cannot interleave their form writes.
+ * Exactly one file keeps the single-zip preview flow untouched.
+ * More than one skips the preview and queues each valid zip with the form's current dimensions, then reports the failures as a single one-line form error while leaving the form empty and ready.
+ */
+export async function handleZipFiles(store: Store, files: File[]): Promise<void> {
+	// A second pick/drop while a batch (or a single parse) is still in flight must not interleave setForm writes and summaries, so ignore it.
+	if (store.state.form.parsing) return;
+	if (files.length <= 1) {
+		const file = files[0];
+		if (file) await handleZipFile(store, file);
+		return;
+	}
+	store.setForm({ parsing: true, error: null });
+	try {
+		// Read the form's dimensions once for the whole batch, so every queued item shares the same values.
+		const f = store.state.form;
+		const dims: QueueDims = { width: Number(f.width), height: Number(f.height), frames: Number(f.frames), steps: Number(f.steps) };
+		const problem = dimsError(dims);
+		if (problem) {
+			store.setForm({ parsing: false, error: problem });
+			return;
+		}
+		const { queued, failures } = await queueZipsFromFiles(store, files, dims);
+		// One form write at the end of the batch: clear back to the empty/ready state and either summarize the failures or clear any stale error.
+		store.setForm({ analysis: null, zipName: null, parsing: false, error: summarizeZipBatch(queued, files.length, failures) });
+		void pump(store);
+	} catch (err) {
+		// No failure path may leave the form stuck in the parsing state.
+		store.setForm({ parsing: false, error: err instanceof Error ? err.message : String(err) });
+		// Pump in case any item was queued before an unexpected error (a no-op otherwise).
+		void pump(store);
+	}
+}
+
+/**
+ * Parse the batch's files sequentially, awaiting each analysis before the next starts so peak memory stays bounded to one parse.
+ * Queues every valid item at the end in one pushQueueMany write, in file-selection order, so FIFO runs the first picked file first (pushing per file would re-persist the whole queue each time, O(N²) bytes for a batch).
+ * A per-file validation failure is isolated: it lands in `failures` and never stops the remaining files.
+ */
+export async function queueZipsFromFiles(store: Store, files: File[], dims: QueueDims): Promise<{ queued: number; failures: ZipBatchFailure[] }> {
+	const failures: ZipBatchFailure[] = [];
+	const items: QueueItem[] = [];
+	for (const file of files) {
+		try {
+			const analysis = await analyzeZip(file, file.name);
+			items.push(queueItemFromAnalysis(analysis, dims, file.name));
+		} catch (err) {
+			failures.push({ name: file.name, message: err instanceof Error ? err.message : String(err) });
+		}
+	}
+	store.pushQueueMany(items);
+	return { queued: items.length, failures };
 }

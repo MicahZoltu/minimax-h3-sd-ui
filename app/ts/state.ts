@@ -159,6 +159,12 @@ export interface Store {
 	 * `nextPending` scans from the end, so the least-recently-added queued item runs next (FIFO).
 	 */
 	pushQueue(item: QueueItem): void;
+	/**
+	 * Add many items to the front of the queue with a single revision bump, emit, and persist.
+	 * Equivalent to calling pushQueue for each item in order, so input [a, b, c] leaves the array newest-first as [c, b, a, ...existing] and the first item runs next.
+	 * An empty list is a no-op (no revision bump, no emit, no persist).
+	 */
+	pushQueueMany(items: QueueItem[]): void;
 	patchQueueItem(id: string, patch: Partial<QueueItem>): void;
 	/**
 	 * Record the latest generation progress for a running item.
@@ -350,6 +356,15 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			queueWrites += 1;
 			emit("queue");
 			// Mutate in-memory synchronously (the UI source of truth), persist best-effort in the background.
+			persistQueue();
+		},
+		pushQueueMany: (items) => {
+			// Equivalent to one pushQueue per item in order, but the batch pays for one revision bump, emit, and full-queue persist instead of N.
+			if (items.length === 0) return;
+			for (const item of items) state.queue.unshift(item);
+			revs.queue += 1;
+			queueWrites += 1;
+			emit("queue");
 			persistQueue();
 		},
 		patchQueueItem: (id, patch) => {
