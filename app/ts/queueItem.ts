@@ -44,7 +44,7 @@ export function queueItemFromAnalysis(analysis: ZipAnalysis, dims: QueueDims, zi
 	};
 }
 
-/** One zip of a multi-selection that failed validation, with its user-facing message. */
+/** One file of a multi-selection that failed validation, with its user-facing message. */
 export interface ZipBatchFailure {
 	name: string;
 	message: string;
@@ -53,7 +53,7 @@ export interface ZipBatchFailure {
 /**
  * Summarize a multi-file batch as a single one-line form error, or null when nothing failed (so a stale error is cleared).
  * Failure lines keep the caller's file order, so the summary reads in selection order.
- * The noun is "files" because a batch member need not be a zip at all (e.g. a picked notes.txt).
+ * The noun is "files" because a batch may mix zips and plain .txt prompt files.
  */
 export function summarizeZipBatch(queued: number, total: number, failures: readonly ZipBatchFailure[]): string | null {
 	if (failures.length === 0) return null;

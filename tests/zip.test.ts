@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { deflateRawSync } from "node:zlib";
-import { analyzeZip, classifyName, classifyNames, buildSourceZip, crc32, MAX_FILE_BYTES } from "../app/ts/zip.js";
+import { analyzeZip, analyzeTxt, analyzeUpload, classifyName, classifyNames, buildSourceZip, crc32, isTxtFile, refVideoBudgetError, refVideoResolutionError, MAX_FILE_BYTES, MAX_PROMPT_BYTES, MAX_PROMPT_CHARS, MAX_REF_VIDEO_TOTAL_FRAMES, MIN_REF_VIDEO_SIDE, MAX_REF_VIDEO_SIDE } from "../app/ts/zip.js";
 import { bytesToDataUrl } from "../app/ts/utils.js";
 
 // 1x1 red PNG bytes.
@@ -186,6 +186,50 @@ describe("reference video/audio classification", () => {
 		const r = classifyNames(["prompt.txt", "start.png", "v1.mp4"]);
 		expect(r.ok).toBe(false);
 		expect(r.errors.join(" ")).toMatch(/mixes/i);
+	});
+});
+
+describe("reference video limits", () => {
+	it("exposes the combined budget as 15 seconds on the 24 fps grid and the documented resolution range", () => {
+		expect(MAX_REF_VIDEO_TOTAL_FRAMES).toBe(15 * 24);
+		expect(MIN_REF_VIDEO_SIDE).toBe(256);
+		expect(MAX_REF_VIDEO_SIDE).toBe(5760);
+	});
+
+	describe("refVideoBudgetError", () => {
+		it("accepts a combined total of exactly the budget and rejects one frame more with the 15 s message", () => {
+			expect(refVideoBudgetError(0, 360)).toBeNull();
+			expect(refVideoBudgetError(120, 240)).toBeNull();
+			expect(refVideoBudgetError(359, 1)).toBeNull();
+			const over = refVideoBudgetError(0, 361);
+			expect(over).toBe("Reference videos are limited to 15 seconds combined across all videos.");
+			expect(refVideoBudgetError(120, 241)).toBe("Reference videos are limited to 15 seconds combined across all videos.");
+			expect(refVideoBudgetError(359, 2)).toBe("Reference videos are limited to 15 seconds combined across all videos.");
+		});
+		it("errors the whole upload when a single oversized source stops at the budget", () => {
+			// A single 20 s source: extraction stops at the 360-frame budget (a trim), so the check runs on the uncapped whole-source count and must fail.
+			expect(refVideoBudgetError(0, 400)).toBe("Reference videos are limited to 15 seconds combined across all videos.");
+		});
+		it("errors mid-way through a multi-video upload once the running total plus the next source exceeds the budget", () => {
+			expect(refVideoBudgetError(200, 300)).toBe("Reference videos are limited to 15 seconds combined across all videos.");
+		});
+	});
+
+	describe("refVideoResolutionError", () => {
+		it("accepts sources inside the documented range on both sides", () => {
+			expect(refVideoResolutionError(256, 256)).toBeNull();
+			expect(refVideoResolutionError(256, 5760)).toBeNull();
+			expect(refVideoResolutionError(5760, 5760)).toBeNull();
+			expect(refVideoResolutionError(1280, 720)).toBeNull();
+		});
+		it("rejects a side below 256 with an increase-the-resolution message", () => {
+			expect(refVideoResolutionError(255, 720)).toMatch(/at least 256 pixels per side.*increase/s);
+			expect(refVideoResolutionError(1280, 255)).toMatch(/at least 256 pixels per side.*increase/s);
+		});
+		it("rejects a side above 5760 with a decrease-the-resolution message", () => {
+			expect(refVideoResolutionError(5761, 720)).toMatch(/at most 5760 pixels per side.*decrease/s);
+			expect(refVideoResolutionError(1280, 5761)).toMatch(/at most 5760 pixels per side.*decrease/s);
+		});
 	});
 });
 
@@ -435,5 +479,62 @@ describe("analyzeZip end to end", () => {
 		]);
 		await expect(analyzeZip(blob, "input.zip")).rejects.toThrow(/not a valid image/i);
 		setImageDims(1, 1);
+	});
+});
+
+describe("plain .txt uploads", () => {
+	it("isTxtFile judges by name suffix alone, never the MIME type", () => {
+		expect(isTxtFile({ name: "notes.txt" })).toBe(true);
+		expect(isTxtFile({ name: "NOTES.TXT" })).toBe(true);
+		expect(isTxtFile({ name: "prompt.txt" })).toBe(true);
+		expect(isTxtFile({ name: "notes.md" })).toBe(false);
+		expect(isTxtFile({ name: "job.zip" })).toBe(false);
+	});
+
+	it("treats the raw .txt bytes as the prompt, trimmed, in prompt mode", async () => {
+		const a = await analyzeTxt(new File(["  a sunset  "], "notes.txt"));
+		expect(a.prompt).toBe("a sunset");
+		expect(a.mode).toBe("prompt");
+		expect(a.files).toEqual([]);
+		expect(a.videos).toEqual([]);
+		expect(a.audios).toEqual([]);
+	});
+
+	it("accepts any .txt-suffixed name regardless of case", async () => {
+		expect((await analyzeTxt(new File(["a cat"], "prompt.txt"))).prompt).toBe("a cat");
+		expect((await analyzeTxt(new File(["a dog"], "notes.TXT"))).prompt).toBe("a dog");
+	});
+
+	it("rejects an oversized prompt before reading the bytes", async () => {
+		const big = new File([new Uint8Array(MAX_PROMPT_BYTES + 1)], "prompt.txt");
+		await expect(analyzeTxt(big)).rejects.toThrow(/too large/i);
+	});
+
+	it("rejects an empty or whitespace-only prompt", async () => {
+		await expect(analyzeTxt(new File(["   "], "empty.txt"))).rejects.toThrow(/empty/i);
+	});
+
+	it("rejects a prompt over the character cap", async () => {
+		await expect(analyzeTxt(new File(["a".repeat(MAX_PROMPT_CHARS + 1)], "long.txt"))).rejects.toThrow(/too long/i);
+	});
+
+	it("analyzeUpload dispatches .txt files to analyzeTxt and zips to analyzeZip", async () => {
+		expect((await analyzeUpload(new File(["a cat"], "prompt.txt"))).prompt).toBe("a cat");
+		const a = await analyzeUpload(new File([buildSourceZip([], "from zip")], "job.zip", { type: "application/zip" }));
+		expect(a.prompt).toBe("from zip");
+		expect(a.mode).toBe("prompt");
+	});
+
+	it("analyzeUpload dispatches an upper-case .txt name end-to-end as a prompt-mode analysis", async () => {
+		const a = await analyzeUpload(new File(["x"], "NOTES.TXT"));
+		expect(a.prompt).toBe("x");
+		expect(a.mode).toBe("prompt");
+		expect(a.files).toEqual([]);
+		expect(a.videos).toEqual([]);
+		expect(a.audios).toEqual([]);
+	});
+
+	it("analyzeUpload rejects a non-zip, non-txt file with the zip picker message", async () => {
+		await expect(analyzeUpload(new File(["x"], "notes.md"))).rejects.toThrow("Please choose a .zip file.");
 	});
 });

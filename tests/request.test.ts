@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { buildVidGenRequest, GENERATION_PRESET, splitFrameInputs } from "../app/ts/request.js";
+import { buildVidGenRequest, refPreviewNote, refVideoFrameCap, GENERATION_PRESET, splitFrameInputs } from "../app/ts/request.js";
 import { bytesToDataUrl } from "../app/ts/utils.js";
 import type { QueueItem } from "../app/ts/types.js";
 
@@ -33,6 +33,40 @@ describe("GENERATION_PRESET", () => {
 		expect(GENERATION_PRESET.txtCfg).toBe(1);
 		expect(GENERATION_PRESET.distilledGuidance).toBe(3.5);
 		expect(GENERATION_PRESET.outputFormat).toBe("webm");
+	});
+});
+
+describe("refVideoFrameCap", () => {
+	it("keeps the max(5, min(jobFrames, extracted)) clamp semantics", () => {
+		expect(refVideoFrameCap(107, 360)).toBe(107);
+		expect(refVideoFrameCap(49, 10)).toBe(10);
+		expect(refVideoFrameCap(107, 5)).toBe(5);
+		// Never below the server's 5-frame minimum, even for a small jobFrames.
+		expect(refVideoFrameCap(3, 360)).toBe(5);
+		expect(refVideoFrameCap(1, 9)).toBe(5);
+	});
+	it("posts the extracted set whole when the job's frame count outruns it", () => {
+		expect(refVideoFrameCap(107, 100)).toBe(100);
+		expect(refVideoFrameCap(360, 360)).toBe(360);
+	});
+});
+
+describe("refPreviewNote", () => {
+	it("notes the clamped prefix span and the job's frame count when the reference outruns the job", () => {
+		// 107 frames at 24 fps ≈ 4.5 s.
+		expect(refPreviewNote(360, 107)).toBe("Only the first 4.5 s of this reference conditions a 107-frame generation.");
+		expect(refPreviewNote(120, 49)).toBe("Only the first 2.0 s of this reference conditions a 49-frame generation.");
+	});
+	it("is null when the whole reference is used", () => {
+		expect(refPreviewNote(100, 107)).toBeNull();
+		expect(refPreviewNote(107, 107)).toBeNull();
+	});
+	it("notes the 5-frame minimum floor when jobFrames is below it", () => {
+		expect(refPreviewNote(360, 3)).toBe("Only the first 0.2 s of this reference conditions a 3-frame generation.");
+	});
+	it("is null for non-finite inputs", () => {
+		expect(refPreviewNote(Number.NaN, 107)).toBeNull();
+		expect(refPreviewNote(360, Number.NaN)).toBeNull();
 	});
 });
 

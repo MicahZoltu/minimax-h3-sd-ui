@@ -22,14 +22,19 @@
 // Start/end files cannot be mixed with any numbered reference, because Ref2VA references and first/last-frame conditioning are mutually exclusive.
 // Any extra file, a missing prompt, conflicting input kinds, or a non-contiguous numbered group is reported as an error before the zip is accepted.
 //
+// Reference videos carry two further limits, and nothing the user provides is ever silently trimmed — an impossible upload errors and lets the user fix it instead.
+// All of an upload's reference videos together are limited to 15 seconds (360 frames on the 24 fps reference grid), and a reference video's source resolution must sit in the documented 256–5760 px per-side range.
+//
 // Images are decoded to PNG/JPEG/WEBP/BMP data URLs here. Video and audio files are handed to the reference extraction worker (refExtract).
-// A video becomes an ordered frame list on the 24 fps reference grid (reported as fps 24) plus an optional WAV soundtrack trimmed to the frames' span; any audio is transcoded to WAV.
+// A video becomes an ordered frame list on the 24 fps reference grid (reported as fps 24) covering the WHOLE source, bounded only by the combined budget above, plus an optional WAV soundtrack trimmed to the frames' span; any audio is transcoded to WAV.
+// Delivered frames keep their native size unless the source exceeds the server's own reference canvas (768 px short edge / 768×1344 px area), which alone triggers a downscale.
 // The original container bytes are retained so a regenerated source zip reproduces the upload.
 //
 // The container format is parsed directly here using the local/central directory records; deflate entries are inflated with the native `DecompressionStream`, so no external zip library is required.
 
 import { bytesToBlob, bytesToDataUrl } from "./utils.js";
 import { extractRefVideo, transcodeAudioRef } from "./refExtract.js";
+import { REF_VIDEO_FPS } from "./refExtract.plan.js";
 import type { RefAudioFile, RefVideoFile, ZipAnalysis, ZipFile } from "./types.js";
 
 export interface ClassifiedEntry {
@@ -60,14 +65,16 @@ export const MAX_REF_IMAGES = MAX_FRAME_NUMBER;
 export const MAX_REF_VIDEOS = 3;
 export const MAX_REF_AUDIOS = 3;
 export const MAX_REF_TOTAL = 12;
-// The extracted frame count to target per reference video.
-// Extraction resamples the source onto the 24 fps reference grid and keeps at most the first 209 frames — about 8.7 seconds, and a 17k+5 grid point matching the server's reference-prefix normalization, so nothing is lost to rounding at the cap.
-// The request clamps the posted frames to the job's own frame count, and the inline payload stays bounded by MAX_REF_FRAME_WIDTH / REF_FRAME_QUALITY.
-export const MAX_REF_VIDEO_FRAMES = 209;
-// Frames are downscaled to at most this width when decoded, to keep the inline-base64 request body reasonable.
-export const MAX_REF_FRAME_WIDTH = 512;
+// The combined reference-video budget, in 24 fps reference frames: 15 seconds across ALL reference videos of one upload (the server's documented limit).
+// There is no per-video truncation cap: extraction delivers the whole source, and an upload whose reference videos would exceed the budget is rejected with an error instead of silently trimmed.
+// To bound the decode work, extraction is handed the remaining budget as its maxFrames, so an oversized source stops at the budget — but the budget check below is judged on the source's UNCAPPED frame count, which makes that stop unreachable in accepted uploads (every capped extraction also fails the check and errors the whole upload).
+export const MAX_REF_VIDEO_TOTAL_FRAMES = 15 * REF_VIDEO_FPS;
 // JPEG quality applied to decoded reference-video frames.
 export const REF_FRAME_QUALITY = 0.7;
+// The documented reference-video input size range, per side, in source pixels.
+// Checked against the SOURCE track dimensions the user provided, independent of the canvas downscale the extraction worker applies; that downscale only ever targets the server's own reference canvas (see refExtract.plan.ts) and never rescues a source outside this range.
+export const MIN_REF_VIDEO_SIDE = 256;
+export const MAX_REF_VIDEO_SIDE = 5760;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_ZIP_BYTES = 200 * 1024 * 1024;
 // Cap on a decoded image's pixel grid (naturalWidth * naturalHeight).
@@ -78,6 +85,26 @@ export const MAX_PROMPT_CHARS = 20000;
 
 // Min frames a reference video must yield after extraction; the server rejects anything below this.
 export const MIN_REF_VIDEO_FRAMES = 5;
+
+/**
+ * The user-facing error when adding one reference video's whole-source frame count would push the upload past the combined reference-video budget, or null when it fits.
+ * Both counts are uncapped whole-source 24 fps frame counts (what the source spans), not capped deliveries: a delivery capped at the remaining budget is itself a trim, and checking the uncapped counts is what makes that cap unreachable — every capped extraction also fails this check, so the whole upload errors instead of any frame being silently dropped.
+ */
+export function refVideoBudgetError(totalFrames: number, nextFrames: number): string | null {
+	if (totalFrames + nextFrames > MAX_REF_VIDEO_TOTAL_FRAMES) return "Reference videos are limited to 15 seconds combined across all videos.";
+	return null;
+}
+
+/**
+ * The user-facing error when a reference video's SOURCE resolution falls outside the documented per-side range, or null when it is inside.
+ * Judged on the source track dimensions the user provided, before any client-side canvas downscale.
+ */
+export function refVideoResolutionError(width: number, height: number): string | null {
+	const dims = `${width}×${height} px`;
+	if (width < MIN_REF_VIDEO_SIDE || height < MIN_REF_VIDEO_SIDE) return `Reference video resolution must be at least ${MIN_REF_VIDEO_SIDE} pixels per side (the source is ${dims}); please increase your video's resolution.`;
+	if (width > MAX_REF_VIDEO_SIDE || height > MAX_REF_VIDEO_SIDE) return `Reference video resolution must be at most ${MAX_REF_VIDEO_SIDE} pixels per side (the source is ${dims}); please decrease your video's resolution.`;
+	return null;
+}
 
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -647,6 +674,25 @@ async function readEntry(bytes: Uint8Array, entry: CentralEntry): Promise<Uint8A
 	return decoded;
 }
 
+/** Enforce the prompt byte cap before any prompt bytes are read. */
+function assertPromptSize(size: number): void {
+	if (size > MAX_PROMPT_BYTES) {
+		throw new Error("prompt.txt is too large.");
+	}
+}
+
+/** Decode raw prompt bytes, trim them, and enforce the emptiness then character-cap rules, returning the validated prompt. */
+function decodePrompt(raw: Uint8Array): string {
+	const prompt = new TextDecoder().decode(raw).trim();
+	if (!prompt) {
+		throw new Error("prompt.txt is empty; please include a prompt.");
+	}
+	if (prompt.length > MAX_PROMPT_CHARS) {
+		throw new Error("The prompt is too long.");
+	}
+	return prompt;
+}
+
 /**
  * Parse and fully validate an uploaded zip blob.
  * Returns a ZipAnalysis on success or throws an Error with a user-facing message.
@@ -686,24 +732,17 @@ export async function analyzeZip(blob: Blob, zipName: string): Promise<ZipAnalys
 	const promptEntry = fileEntries.find((e) => e.name === result.promptName);
 	let prompt: string;
 	if (promptEntry) {
-		if (promptEntry.uncompressedSize > MAX_PROMPT_BYTES) {
-			throw new Error("prompt.txt is too large.");
-		}
+		assertPromptSize(promptEntry.uncompressedSize);
 		let promptRaw: Uint8Array;
 		try {
 			promptRaw = await readEntry(bytes, promptEntry);
 		} catch {
 			throw new Error("The prompt.txt file could not be read.");
 		}
-		prompt = new TextDecoder().decode(promptRaw).trim();
+		prompt = decodePrompt(promptRaw);
 	} else {
+		// Unreachable when classifyNames passed, which guarantees exactly one top-level prompt entry.
 		prompt = "";
-	}
-	if (!prompt) {
-		throw new Error("prompt.txt is empty; please include a prompt.");
-	}
-	if (prompt.length > MAX_PROMPT_CHARS) {
-		throw new Error("The prompt is too long.");
 	}
 
 	const files: ZipFile[] = [];
@@ -729,6 +768,8 @@ export async function analyzeZip(blob: Blob, zipName: string): Promise<ZipAnalys
 	}
 
 	const videos: RefVideoFile[] = [];
+	// Running whole-source frame count of the reference videos accepted so far, charged against the combined budget.
+	let refFramesUsed = 0;
 	for (const name of result.videoNames) {
 		const entry = fileEntries.find((e) => e.name === name);
 		if (!entry) continue;
@@ -741,10 +782,16 @@ export async function analyzeZip(blob: Blob, zipName: string): Promise<ZipAnalys
 		try {
 			const container = decoded.slice();
 			const sourceDataUrl = bytesToDataUrl(decoded, guessMediaMime(name));
-			const extracted = await extractRefVideo(bytesToBlob(container, guessMediaMime(name)), MAX_REF_VIDEO_FRAMES, MAX_REF_FRAME_WIDTH, REF_FRAME_QUALITY);
+			// Extraction is handed the REMAINING combined budget so an oversized source stops there instead of decoding unbounded; the budget check on the uncapped source count below is what errors the upload whenever that stop actually bit.
+			const extracted = await extractRefVideo(bytesToBlob(container, guessMediaMime(name)), MAX_REF_VIDEO_TOTAL_FRAMES - refFramesUsed, REF_FRAME_QUALITY);
+			const budgetProblem = refVideoBudgetError(refFramesUsed, extracted.sourceFrames);
+			if (budgetProblem) throw new Error(`${name}: ${budgetProblem}`);
+			const resolutionProblem = refVideoResolutionError(extracted.sourceWidth, extracted.sourceHeight);
+			if (resolutionProblem) throw new Error(`${name}: ${resolutionProblem}`);
 			if (extracted.frames.length < MIN_REF_VIDEO_FRAMES) {
 				throw new Error(`${name} is too short for a reference video; it needs at least ${MIN_REF_VIDEO_FRAMES} frames.`);
 			}
+			refFramesUsed += extracted.sourceFrames;
 			videos.push({ name, fps: extracted.fps, frames: extracted.frames, audio: extracted.audio, sourceDataUrl });
 		} catch (err) {
 			throw new Error(err instanceof Error ? err.message : String(err));
@@ -775,4 +822,34 @@ export async function analyzeZip(blob: Blob, zipName: string): Promise<ZipAnalys
 		throw new Error("The zip is missing a required prompt.txt file.");
 	}
 	return { prompt, mode: result.mode, files, videos, audios };
+}
+
+/**
+ * Whether a picked/dropped file is a plain .txt prompt upload, judged by name suffix alone.
+ * The MIME type is deliberately ignored: dropped files often report an empty type.
+ */
+export function isTxtFile(file: { name: string }): boolean {
+	return /\.txt$/i.test(file.name);
+}
+
+/**
+ * Validate a single plain .txt file as a prompt-only upload: the file's bytes ARE the prompt.
+ * The prompt validation runs through the same shared helpers as analyzeZip's prompt path (byte cap before reading, then trim, then emptiness, then the character cap), so the messages stay identical.
+ */
+export async function analyzeTxt(file: File): Promise<ZipAnalysis> {
+	assertPromptSize(file.size);
+	let raw: Uint8Array;
+	try {
+		raw = new Uint8Array(await file.arrayBuffer());
+	} catch {
+		throw new Error("The file could not be read.");
+	}
+	return { prompt: decodePrompt(raw), mode: "prompt", files: [], videos: [], audios: [] };
+}
+
+/**
+ * Intake dispatcher for one picked/dropped file: a plain .txt carries the prompt directly, anything else is parsed as a zip.
+ */
+export async function analyzeUpload(file: File): Promise<ZipAnalysis> {
+	return isTxtFile(file) ? analyzeTxt(file) : analyzeZip(file, file.name);
 }

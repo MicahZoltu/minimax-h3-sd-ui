@@ -1,7 +1,8 @@
 import { describe, it, expect } from "bun:test";
 import { createHistoryStore, estimateStorage, isHistoryItem, isQueueItem, type HistoryBackend, type HistoryMedia } from "../app/ts/history.js";
 import { createIdbHistory, createIdbQueue } from "../app/ts/idb.js";
-import { fileKey, thumbnailKey, videoKey } from "../app/ts/media.js";
+import { fileKey, refAudioKey, refVideoAudioKey, refVideoSourceKey, refVideoThumbKey, thumbnailKey, videoKey } from "../app/ts/media.js";
+import { predatesCutoff } from "../app/ts/storageDate.js";
 import { memoryQueueBackend } from "./support/queueBackend.js";
 import type { HistoryItem, QueueItem } from "../app/ts/types.js";
 
@@ -63,6 +64,7 @@ type MemoryBackend = HistoryBackend & {
 	mediaReadCount(key: string): number;
 	setViewedCount(): number;
 	saveCount(): number;
+	failSaves(ids: string[]): void;
 };
 
 function memoryBackend(): MemoryBackend {
@@ -71,13 +73,19 @@ function memoryBackend(): MemoryBackend {
 	const reads = new Map<string, number>();
 	let viewedWrites = 0;
 	let saves = 0;
+	const failingSaves = new Set<string>();
 	return {
 		isPersistent: () => true,
 		async loadAll(): Promise<HistoryItem[]> {
 			return data.map((i) => ({ ...i, persisted: true }));
 		},
+		async listArchiveMeta() {
+			// Mirror the real scan: every record's id + finite createdAt, evicted (non-resident) records included.
+			return data.filter((i) => Number.isFinite(i.createdAt)).map((i) => ({ id: i.id, createdAt: i.createdAt }));
+		},
 		async save(item, videoBlob) {
 			saves += 1;
+			if (failingSaves.has(item.id)) throw new Error("save failed");
 			data.push(item);
 			mediaMap.set(videoKey(item.id), videoBlob);
 		},
@@ -92,16 +100,20 @@ function memoryBackend(): MemoryBackend {
 		},
 		async remove(id) {
 			const index = data.findIndex((x) => x.id === id);
-			const removed = data[index];
 			if (index < 0) return;
 			data.splice(index, 1);
-			// Mirror the real IndexedDB remove: drop the video, thumbnail, and every ${id}:file:<i> media key for this item.
-			if (removed) {
-				const fileCount = removed.files.length;
-				mediaMap.delete(videoKey(id));
-				mediaMap.delete(thumbnailKey(id));
-				for (let i = 0; i < fileCount; i++) mediaMap.delete(fileKey(id, i));
+			// Mirror the real IndexedDB remove: drop the bare video key plus every `${id}:`-prefixed media key (thumbnail, files, and reference-video/audio payloads) for this item.
+			mediaMap.delete(videoKey(id));
+			for (const key of mediaMap.keys()) {
+				if (key.startsWith(`${id}:`)) mediaMap.delete(key);
 			}
+		},
+		async countBefore(cutoffMs) {
+			return data.filter((i) => predatesCutoff(i.createdAt, cutoffMs)).length;
+		},
+		async removeBefore(cutoffMs) {
+			const matches = data.filter((i) => predatesCutoff(i.createdAt, cutoffMs)).map((i) => i.id);
+			for (const id of matches) await this.remove(id);
 		},
 		async clear() {
 			data.length = 0;
@@ -116,6 +128,9 @@ function memoryBackend(): MemoryBackend {
 		mediaReadCount: (key) => reads.get(key) ?? 0,
 		setViewedCount: () => viewedWrites,
 		saveCount: () => saves,
+		failSaves: (ids) => {
+			for (const id of ids) failingSaves.add(id);
+		},
 	};
 }
 
@@ -134,10 +149,25 @@ function validatingBackend(): HistoryBackend & { setData(entries: unknown[]): vo
 			}
 			return out;
 		},
+		async listArchiveMeta() {
+			const out: { id: string; createdAt: number }[] = [];
+			for (const entry of data) {
+				if (typeof entry !== "object" || entry === null || !("id" in entry) || !("createdAt" in entry)) continue;
+				const id = entry.id;
+				const createdAt = entry.createdAt;
+				if (typeof id !== "string" || typeof createdAt !== "number" || !Number.isFinite(createdAt)) continue;
+				out.push({ id, createdAt });
+			}
+			return out;
+		},
 		async save() {},
 		async storeMedia() {},
 		async setViewed() {},
 		async remove() {},
+		async countBefore() {
+			return 0;
+		},
+		async removeBefore() {},
 		async clear() {},
 		async loadMedia() {
 			return null;
@@ -247,11 +277,14 @@ describe("no-browser fallback (Bun has no indexedDB)", () => {
 		};
 		expect(backend.isPersistent()).toBe(false);
 		await expect(backend.loadAll()).resolves.toEqual([]);
+		await expect(backend.listArchiveMeta()).resolves.toEqual([]);
 		await expect(backend.save(item, new Blob([]))).resolves.toBeUndefined();
 		await expect(backend.storeMedia("k", new Blob([]))).resolves.toBeUndefined();
 		await expect(backend.setViewed("id", true)).resolves.toBeUndefined();
 		await expect(backend.loadMedia("k")).resolves.toBeNull();
 		await expect(backend.remove("id")).resolves.toBeUndefined();
+		await expect(backend.countBefore(0)).resolves.toBe(0);
+		await expect(backend.removeBefore(0)).resolves.toBeUndefined();
 		await expect(backend.clear()).resolves.toBeUndefined();
 	});
 
@@ -306,10 +339,39 @@ describe("createHistoryStore", () => {
 		const store = createHistoryStore(backend);
 		const item = makeItem();
 		store.add(item, dummyMedia());
-		expect(item.persisted).toBe(false);
+		// The flag flips optimistically inside add(), before the backend save resolves, so an in-flight record is never double-counted against the archive copy its own save writes.
+		expect(item.persisted).toBe(true);
 		await flush();
 		expect(item.persisted).toBe(true);
 		expect(backend.data().some((i) => i.id === item.id)).toBe(true);
+	});
+
+	it("stops storing media when the item is deleted mid-save", async () => {
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const stored: string[] = [];
+		// A save that stays in flight until the test releases it, so the deletion can land mid-save.
+		const gatedBackend: HistoryBackend = {
+			isPersistent: () => true,
+			async loadAll() { return []; },
+			async listArchiveMeta() { return []; },
+			async save() { await gate; },
+			async storeMedia(key) { stored.push(key); },
+			async setViewed() {},
+			async remove() {},
+			async countBefore() { return 0; },
+			async removeBefore() {},
+			async clear() {},
+			async loadMedia() { return null; },
+		};
+		const store = createHistoryStore(gatedBackend);
+		const item = makeItem();
+		store.add(item, dummyMedia({ thumbnail: new Blob(["t"]), files: [new Blob(["f0"])] }));
+		store.remove(item.id);
+		release();
+		await flush();
+		// The save resolved after the item was already gone, so not one media store may follow it.
+		expect(stored).toEqual([]);
 	});
 
 	it("stores the thumbnail and file blobs to the backend media store", async () => {
@@ -393,34 +455,46 @@ describe("createHistoryStore", () => {
 		expect(backend.data().find((i) => i.id === a.id)?.viewed).toBe(true);
 	});
 
-	it("remove deletes the item's media from the backend (video, thumbnail, and every file)", async () => {
+	it("remove deletes the item's media from the backend (video, thumbnail, files, and reference media)", async () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const id = "h_remove_media";
 		const item = {
-			...makeItem({ id }),
+			...makeItem({
+				id,
+				videos: [{ name: "r1.mp4", thumbKey: refVideoThumbKey(id, 0), thumbBytes: 2, audioKey: refVideoAudioKey(id, 0), audioBytes: 2, sourceKey: refVideoSourceKey(id, 0), sourceBytes: 2 }],
+				audios: [{ name: "r1.wav", key: refAudioKey(id, 0), bytes: 2 }],
+			}),
 			files: [
 				{ name: "a.png", key: fileKey(id, 0), bytes: 2 },
 				{ name: "b.png", key: fileKey(id, 1), bytes: 2 },
 			],
 		};
-		store.add(item, dummyMedia({ files: [new Blob(["f0"]), new Blob(["f1"])] }));
+		store.add(item, dummyMedia({ files: [new Blob(["f0"]), new Blob(["f1"])], videoThumbs: [new Blob(["vt0"])], videoAudios: [new Blob(["va0"])], videoSources: [new Blob(["vs0"])], audioSources: [new Blob(["as0"])] }));
 		await flush();
 
 		expect(backend.media(videoKey(id))).not.toBeNull();
 		expect(backend.media(thumbnailKey(id))).not.toBeNull();
 		expect(backend.media(fileKey(id, 0))).not.toBeNull();
 		expect(backend.media(fileKey(id, 1))).not.toBeNull();
+		expect(backend.media(refVideoThumbKey(id, 0))).not.toBeNull();
+		expect(backend.media(refVideoAudioKey(id, 0))).not.toBeNull();
+		expect(backend.media(refVideoSourceKey(id, 0))).not.toBeNull();
+		expect(backend.media(refAudioKey(id, 0))).not.toBeNull();
 
 		store.remove(id);
 		await flush();
 
 		// A direct read of every derived media key reports null after removal, mirroring the idb remove
-		// that also deletes the video/thumbnail keys and every ${id}:file:<i> via the bound range cursor.
+		// that also deletes the video/thumbnail keys and every `${id}:`-prefixed key (files and reference-video/audio payloads alike) via the bound range cursor.
 		expect(backend.media(videoKey(id))).toBeNull();
 		expect(backend.media(thumbnailKey(id))).toBeNull();
 		expect(backend.media(fileKey(id, 0))).toBeNull();
 		expect(backend.media(fileKey(id, 1))).toBeNull();
+		expect(backend.media(refVideoThumbKey(id, 0))).toBeNull();
+		expect(backend.media(refVideoAudioKey(id, 0))).toBeNull();
+		expect(backend.media(refVideoSourceKey(id, 0))).toBeNull();
+		expect(backend.media(refAudioKey(id, 0))).toBeNull();
 		expect(await store.loadVideo(id)).toBeNull();
 		expect(await store.loadThumbnail(id)).toBeNull();
 		expect(await store.loadFileByKey(fileKey(id, 0))).toBeNull();
@@ -470,16 +544,37 @@ describe("createHistoryStore", () => {
 		expect(backend.data().length).toBe(1);
 	});
 
-	it("removeOldest removes the N oldest items", async () => {
+	it("removeOldest removes the N oldest items and their media", async () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
 		const items = [makeItem({ createdAt: 1 }), makeItem({ createdAt: 2 }), makeItem({ createdAt: 3 }), makeItem({ createdAt: 4 })];
-		for (const i of items) store.add(i, dummyMedia());
+		const first = items[0];
+		const second = items[1];
+		if (!first || !second) throw new Error("test setup failed");
+		// The two oldest carry reference video/audio media so their cleanup is asserted alongside the record removal.
+		store.add(first, dummyMedia({ videoThumbs: [new Blob(["vt0"])], videoAudios: [new Blob(["va0"])], videoSources: [new Blob(["vs0"])], audioSources: [new Blob(["as0"])] }));
+		store.add(second, dummyMedia({ videoThumbs: [new Blob(["vt0"])], videoAudios: [new Blob(["va0"])], videoSources: [new Blob(["vs0"])], audioSources: [new Blob(["as0"])] }));
+		for (const i of items.slice(2)) store.add(i, dummyMedia());
 		await flush();
+		expect(backend.media(refVideoThumbKey(first.id, 0))).not.toBeNull();
+		expect(backend.media(refVideoAudioKey(first.id, 0))).not.toBeNull();
+		expect(backend.media(refVideoSourceKey(first.id, 0))).not.toBeNull();
+		expect(backend.media(refAudioKey(first.id, 0))).not.toBeNull();
 
-		store.removeOldest(2);
+		await store.removeOldest(2);
+		await flush();
 		expect(store.items().map((i) => i.id)).toEqual([items[2]?.id ?? "", items[3]?.id ?? ""]);
 		expect(backend.data().length).toBe(2);
+		// The removed oldest items' reference-media keys are deleted; a survivor's video key stays.
+		expect(backend.media(refVideoThumbKey(first.id, 0))).toBeNull();
+		expect(backend.media(refVideoAudioKey(first.id, 0))).toBeNull();
+		expect(backend.media(refVideoSourceKey(first.id, 0))).toBeNull();
+		expect(backend.media(refAudioKey(first.id, 0))).toBeNull();
+		expect(backend.media(refVideoThumbKey(second.id, 0))).toBeNull();
+		expect(backend.media(refAudioKey(second.id, 0))).toBeNull();
+		const third = items[2];
+		if (!third) throw new Error("test setup failed");
+		expect(backend.media(videoKey(third.id))).not.toBeNull();
 	});
 
 	it("removeOldest ignores a non-positive count", async () => {
@@ -488,21 +583,275 @@ describe("createHistoryStore", () => {
 		const a = makeItem({ createdAt: 1 });
 		store.add(a, dummyMedia());
 		await flush();
-		store.removeOldest(0);
-		store.removeOldest(-3);
+		await store.removeOldest(0);
+		await store.removeOldest(-3);
 		expect(store.items().map((i) => i.id)).toEqual([a.id]);
+	});
+
+	it("removeOldest deletes across the resident boundary (evicted archive items included)", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const created: HistoryItem[] = [];
+		for (let i = 0; i < 105; i++) {
+			const item = makeItem({ createdAt: i + 1 });
+			created.push(item);
+			store.add(item, dummyMedia());
+		}
+		await flush();
+		// The archive holds all 105 while only the newest 100 are resident.
+		expect(store.items().length).toBe(100);
+		expect(backend.data().length).toBe(105);
+		const oldestEvicted = created[0];
+		const oldestResident = created[5];
+		const newest = created[104];
+		if (!oldestEvicted || !oldestResident || !newest) throw new Error("test setup failed");
+
+		await store.removeOldest(10);
+
+		// The 10 oldest of the WHOLE archive die: the 5 evicted (createdAt 1-5) and the 5 oldest residents (6-10), leaving 95 everywhere.
+		expect(store.items().length).toBe(95);
+		expect(store.items().every((i) => i.createdAt >= 11)).toBe(true);
+		expect(backend.data().length).toBe(95);
+		// Both victim groups lost their media; the newest survivor's video key is intact.
+		expect(backend.media(videoKey(oldestEvicted.id))).toBeNull();
+		expect(backend.media(thumbnailKey(oldestEvicted.id))).toBeNull();
+		expect(backend.media(videoKey(oldestResident.id))).toBeNull();
+		expect(backend.media(thumbnailKey(oldestResident.id))).toBeNull();
+		expect(backend.media(videoKey(newest.id))).not.toBeNull();
+	});
+
+	it("removeOldest includes non-persisted residents in the tail", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		// Two archive-only records with no resident counterpart (as after an eviction).
+		const archivedOld = makeItem({ createdAt: 10 });
+		const archivedNew = makeItem({ createdAt: 20 });
+		await backend.save(archivedOld, new Blob(["v"]));
+		await backend.save(archivedNew, new Blob(["v"]));
+		// A resident whose save failed keeps `persisted === false` while carrying the oldest createdAt of all.
+		const failed = makeItem({ createdAt: 5 });
+		const good = makeItem({ createdAt: 30 });
+		backend.failSaves([failed.id]);
+		store.add(failed, dummyMedia());
+		store.add(good, dummyMedia());
+		await flush();
+		expect(failed.persisted).toBe(false);
+
+		await store.removeOldest(2);
+
+		// The failed resident (5) and archivedOld (10) are the two oldest of the union; archivedNew and the good resident survive.
+		expect(store.items().map((i) => i.id)).toEqual([good.id]);
+		expect(backend.data().map((i) => i.id)).toEqual([archivedNew.id, good.id]);
+	});
+
+	it("removeOldest never deletes an item with a non-finite createdAt", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const broken = makeItem({ createdAt: Number.NaN });
+		const newest = makeItem({ createdAt: 3 });
+		store.add(broken, dummyMedia());
+		store.add(makeItem({ createdAt: 1 }), dummyMedia());
+		store.add(makeItem({ createdAt: 2 }), dummyMedia());
+		store.add(newest, dummyMedia());
+		await flush();
+
+		await store.removeOldest(2);
+
+		// The NaN item is not an n-tail candidate (its age is unknown), so n effectively shrinks to the two finite oldest and the NaN record survives everywhere.
+		expect(store.items().some((i) => i.id === broken.id)).toBe(true);
+		expect(backend.data().some((i) => i.id === broken.id)).toBe(true);
+		expect(store.items().map((i) => i.id)).toEqual([broken.id, newest.id]);
+		expect(backend.data().length).toBe(2);
+	});
+
+	it("removeOldest is deterministic when several items share the exact same createdAt", async () => {
+		const run = async (): Promise<{ deleted: string[]; survivors: string[] }> => {
+			const backend = memoryBackend();
+			const store = createHistoryStore(backend);
+			// Three items tied on createdAt; only the ids and insertion order distinguish them.
+			store.add(makeItem({ id: "h_tie_a", createdAt: 1000 }), dummyMedia());
+			store.add(makeItem({ id: "h_tie_b", createdAt: 1000 }), dummyMedia());
+			store.add(makeItem({ id: "h_tie_c", createdAt: 1000 }), dummyMedia());
+			await flush();
+			const deleted = await store.removeOldest(2);
+			return { deleted, survivors: store.items().map((i) => i.id) };
+		};
+		const first = await run();
+		const second = await run();
+		// Exactly two of the three tied items die, chosen deterministically (stable sort over the union's insertion order).
+		expect(first.deleted).toEqual(["h_tie_a", "h_tie_b"]);
+		expect(first.survivors).toEqual(["h_tie_c"]);
+		// Two identical setups must pick the identical two victims and the identical survivor.
+		expect(second.deleted).toEqual(first.deleted);
+		expect(second.survivors).toEqual(first.survivors);
+	});
+
+	it("removeOldest removes non-resident victims' media from the backend (files and reference media included)", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const id = "h_evicted_victim";
+		const survivor = makeItem({ createdAt: 104 });
+		const item = {
+			...makeItem({ id, createdAt: 0, videos: [{ name: "r1.mp4", thumbKey: refVideoThumbKey(id, 0), thumbBytes: 2, audioKey: refVideoAudioKey(id, 0), audioBytes: 2, sourceKey: refVideoSourceKey(id, 0), sourceBytes: 2 }], audios: [{ name: "r1.wav", key: refAudioKey(id, 0), bytes: 2 }] }),
+			files: [{ name: "a.png", key: fileKey(id, 0), bytes: 2 }],
+		};
+		store.add(item, dummyMedia({ files: [new Blob(["f0"])], videoThumbs: [new Blob(["vt0"])], videoAudios: [new Blob(["va0"])], videoSources: [new Blob(["vs0"])], audioSources: [new Blob(["as0"])] }));
+		for (let i = 1; i <= 103; i++) store.add(makeItem({ createdAt: i }), dummyMedia());
+		store.add(survivor, dummyMedia());
+		await flush();
+		// The victim was evicted past the in-memory cap while its archive copy and media all survived.
+		expect(store.items().every((i) => i.id !== id)).toBe(true);
+		// Re-cache the victim's video so the deletion must also drop the memory-side cache entry, not just the backend keys.
+		expect(await store.loadVideo(id)).not.toBeNull();
+
+		await store.removeOldest(1);
+		await flush();
+
+		expect(backend.data().length).toBe(104);
+		expect(backend.media(videoKey(id))).toBeNull();
+		expect(backend.media(thumbnailKey(id))).toBeNull();
+		expect(backend.media(fileKey(id, 0))).toBeNull();
+		expect(backend.media(refVideoThumbKey(id, 0))).toBeNull();
+		expect(backend.media(refVideoAudioKey(id, 0))).toBeNull();
+		expect(backend.media(refVideoSourceKey(id, 0))).toBeNull();
+		expect(backend.media(refAudioKey(id, 0))).toBeNull();
+		// The stale cache entry is gone too: the read falls through to the now-empty backend instead of serving the deleted Blob.
+		expect(await store.loadVideo(id)).toBeNull();
+		expect(await store.loadThumbnail(id)).toBeNull();
+		expect(await store.loadFileByKey(fileKey(id, 0))).toBeNull();
+		// A survivor's media is untouched.
+		expect(backend.media(videoKey(survivor.id))).not.toBeNull();
+	});
+
+	it("countAll equals the archive-wide deletion universe (residents deduped against the archive)", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		for (let i = 0; i < 105; i++) store.add(makeItem({ createdAt: i + 1 }), dummyMedia());
+		await flush();
+		expect(store.items().length).toBe(100);
+		// 105 archive records with the 100 residents deduped away, not 205.
+		expect(await store.countAll()).toBe(105);
+		await store.removeOldest(105);
+		expect(await store.countAll()).toBe(0);
+		expect(backend.data().length).toBe(0);
+	});
+
+	it("countAll falls back to the finite resident count when no backend exists", async () => {
+		const store = createHistoryStore(null);
+		store.add(makeItem({ createdAt: 1 }), dummyMedia());
+		store.add(makeItem({ createdAt: Number.NaN }), dummyMedia());
+		expect(await store.countAll()).toBe(1);
+	});
+
+	it("removeBefore deletes only items strictly older than the cutoff", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const items = [makeItem({ createdAt: 1000 }), makeItem({ createdAt: 2000 }), makeItem({ createdAt: 3000 })];
+		for (const i of items) store.add(i, dummyMedia());
+		await flush();
+
+		await store.removeBefore(2000);
+		// The boundary item (createdAt === cutoff) survives, resident and archived alike.
+		expect(store.items().map((i) => i.createdAt)).toEqual([2000, 3000]);
+		expect(backend.data().map((i) => i.createdAt)).toEqual([2000, 3000]);
+	});
+
+	it("removeBefore keeps items with a non-finite createdAt", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const finite = makeItem({ createdAt: 1000 });
+		// add() does not run isHistoryItem validation (that gate is for persisted records), so a NaN createdAt rides in memory; the predicate must still never delete it.
+		const broken = makeItem({ createdAt: Number.NaN });
+		store.add(finite, dummyMedia());
+		store.add(broken, dummyMedia());
+		await flush();
+
+		await store.removeBefore(5000);
+		expect(store.items().some((i) => i.id === finite.id)).toBe(false);
+		expect(store.items().map((i) => i.id)).toContain(broken.id);
+		expect(backend.data().map((i) => i.id)).toContain(broken.id);
+	});
+
+	it("removeBefore removes each deleted item's media from the backend (including reference media)", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const idA = "h_rb_media_a";
+		const idB = "h_rb_media_b";
+		const itemA = {
+			...makeItem({ id: idA, createdAt: 1000, videos: [{ name: "r1.mp4", thumbKey: refVideoThumbKey(idA, 0), thumbBytes: 2, audioKey: refVideoAudioKey(idA, 0), audioBytes: 2, sourceKey: refVideoSourceKey(idA, 0), sourceBytes: 2 }], audios: [{ name: "r1.wav", key: refAudioKey(idA, 0), bytes: 2 }] }),
+			files: [{ name: "a.png", key: fileKey(idA, 0), bytes: 2 }],
+		};
+		const itemB = { ...makeItem({ id: idB, createdAt: 2000 }), files: [{ name: "b.png", key: fileKey(idB, 0), bytes: 2 }] };
+		store.add(itemA, dummyMedia({ files: [new Blob(["a"])], videoThumbs: [new Blob(["va"])], videoAudios: [new Blob(["vaa"])], videoSources: [new Blob(["vas"])], audioSources: [new Blob(["aas"])] }));
+		store.add(itemB, dummyMedia({ files: [new Blob(["b"])] }));
+		await flush();
+
+		await store.removeBefore(2000);
+		// Every media key of the deleted item is gone — the reference-video/audio keys included; the survivor's keys are all intact.
+		expect(backend.media(videoKey(idA))).toBeNull();
+		expect(backend.media(thumbnailKey(idA))).toBeNull();
+		expect(backend.media(fileKey(idA, 0))).toBeNull();
+		expect(backend.media(refVideoThumbKey(idA, 0))).toBeNull();
+		expect(backend.media(refVideoAudioKey(idA, 0))).toBeNull();
+		expect(backend.media(refVideoSourceKey(idA, 0))).toBeNull();
+		expect(backend.media(refAudioKey(idA, 0))).toBeNull();
+		expect(backend.media(videoKey(idB))).not.toBeNull();
+		expect(backend.media(thumbnailKey(idB))).not.toBeNull();
+		expect(backend.media(fileKey(idB, 0))).not.toBeNull();
+	});
+
+	it("removeBefore is a no-op when nothing precedes the cutoff", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		const a = makeItem({ createdAt: 2000 });
+		store.add(a, dummyMedia());
+		await flush();
+
+		await store.removeBefore(1000);
+		expect(store.items().map((i) => i.id)).toEqual([a.id]);
+		expect(backend.data().length).toBe(1);
+	});
+
+	it("countBefore equals what removeBefore deletes", async () => {
+		const backend = memoryBackend();
+		const store = createHistoryStore(backend);
+		// Push past MAX_IN_MEMORY so part of the matching archive is evicted from memory but still counted and deleted.
+		for (let i = 0; i < 105; i++) store.add(makeItem({ createdAt: i + 1 }), dummyMedia());
+		await flush();
+		expect(store.items().length).toBe(100);
+		expect(backend.data().length).toBe(105);
+
+		const cutoff = 51;
+		const before = backend.data().length;
+		const count = await store.countBefore(cutoff);
+		await store.removeBefore(cutoff);
+		expect(backend.data().length).toBe(before - count);
+		expect(store.items().every((i) => i.createdAt >= cutoff)).toBe(true);
+	});
+
+	it("countBefore falls back to the resident predicate count when no backend exists", async () => {
+		const store = createHistoryStore(null);
+		store.add(makeItem({ createdAt: 1000 }), dummyMedia());
+		store.add(makeItem({ createdAt: 2000 }), dummyMedia());
+		expect(await store.countBefore(2000)).toBe(1);
+		expect(await store.countBefore(1000)).toBe(0);
 	});
 
 	it("clear removes every item from memory and the backend", async () => {
 		const backend = memoryBackend();
 		const store = createHistoryStore(backend);
-		store.add(makeItem({ createdAt: 1 }), dummyMedia());
+		const a = makeItem({ createdAt: 1 });
+		store.add(a, dummyMedia({ videoThumbs: [new Blob(["vt0"])], videoAudios: [new Blob(["va0"])], videoSources: [new Blob(["vs0"])], audioSources: [new Blob(["as0"])] }));
 		store.add(makeItem({ createdAt: 2 }), dummyMedia());
 		await flush();
+		expect(backend.media(refVideoThumbKey(a.id, 0))).not.toBeNull();
+		expect(backend.media(refAudioKey(a.id, 0))).not.toBeNull();
 
 		store.clear();
 		expect(store.items().length).toBe(0);
 		expect(backend.data().length).toBe(0);
+		expect(backend.media(refVideoThumbKey(a.id, 0))).toBeNull();
+		expect(backend.media(refAudioKey(a.id, 0))).toBeNull();
 
 		const reloaded = createHistoryStore(backend);
 		await reloaded.load();

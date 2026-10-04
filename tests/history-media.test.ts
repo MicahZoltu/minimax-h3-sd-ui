@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { createHistoryStore, type HistoryBackend, type HistoryStore } from "../app/ts/history.js";
 import { fileKey, thumbnailKey, videoKey } from "../app/ts/media.js";
+import { predatesCutoff } from "../app/ts/storageDate.js";
 import type { HistoryItem } from "../app/ts/types.js";
 
 // A faithful in-memory HistoryBackend mirroring idb.ts's store layout: history records under the
@@ -29,14 +30,24 @@ function memoryHistoryBackend(): MemoryHistoryBackend {
 		async setViewed(): Promise<void> {},
 		async remove(id): Promise<void> {
 			const index = records.findIndex((r) => r.id === id);
-			const removed = records[index];
 			if (index < 0) return;
 			records.splice(index, 1);
-			if (removed) {
-				mediaMap.delete(videoKey(id));
-				mediaMap.delete(thumbnailKey(id));
-				for (let i = 0; i < removed.files.length; i++) mediaMap.delete(fileKey(id, i));
+			// Mirror the real IndexedDB remove: drop the bare video key plus every `${id}:`-prefixed media key (thumbnail, files, and reference-video/audio payloads) for this item.
+			mediaMap.delete(videoKey(id));
+			for (const key of mediaMap.keys()) {
+				if (key.startsWith(`${id}:`)) mediaMap.delete(key);
 			}
+		},
+		async listArchiveMeta(): Promise<{ id: string; createdAt: number }[]> {
+			// Mirror the real scan: every record's id + finite createdAt, evicted (non-resident) records included.
+			return records.filter((r) => Number.isFinite(r.createdAt)).map((r) => ({ id: r.id, createdAt: r.createdAt }));
+		},
+		async countBefore(cutoffMs): Promise<number> {
+			return records.filter((r) => predatesCutoff(r.createdAt, cutoffMs)).length;
+		},
+		async removeBefore(cutoffMs): Promise<void> {
+			const matches = records.filter((r) => predatesCutoff(r.createdAt, cutoffMs)).map((r) => r.id);
+			for (const id of matches) await this.remove(id);
 		},
 		async clear(): Promise<void> {
 			records.length = 0;

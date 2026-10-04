@@ -110,6 +110,23 @@ describe("queueZipsFromFiles", () => {
 		expect(nextPending(s)?.zipName).toBe("good1.zip");
 	});
 
+	it("queues a mixed batch of a zip and a plain .txt prompt file in selection order", async () => {
+		const s = store();
+		const dims = { width: 768, height: 320, frames: 49, steps: 12 };
+		const { queued, failures } = await queueZipsFromFiles(s, [zipFile("good.zip", "one"), new File(["a sunset"], "notes.txt")], dims);
+		expect(queued).toBe(2);
+		expect(failures).toEqual([]);
+		// pushQueueMany lands newest-first, so the .txt sits on top while the first picked file still runs first (FIFO).
+		expect(s.state.queue.map((i) => i.zipName)).toEqual(["notes.txt", "good.zip"]);
+		expect(nextPending(s)?.zipName).toBe("good.zip");
+		const txtItem = s.state.queue.find((i) => i.zipName === "notes.txt");
+		expect(txtItem?.mode).toBe("prompt");
+		expect(txtItem?.prompt).toBe("a sunset");
+		expect(txtItem?.files).toEqual([]);
+		expect(txtItem?.videos).toEqual([]);
+		expect(txtItem?.audios).toEqual([]);
+	});
+
 	it("queues two different zips sharing one file name as independent items with distinct ids", async () => {
 		const s = store();
 		const { queued, failures } = await queueZipsFromFiles(s, [zipFile("same.zip", "one"), zipFile("same.zip", "two")], { width: 512, height: 512, frames: 107, steps: 20 });
@@ -122,13 +139,13 @@ describe("queueZipsFromFiles", () => {
 
 	it("queues nothing when every file fails, reporting each failure in order", async () => {
 		const s = store();
-		const notes = new File(["hello"], "notes.txt");
+		const notes = new File(["hello"], "notes.md");
 		const corrupt = new File(["not a zip"], "corrupt.zip", { type: "application/zip" });
 		const { queued, failures } = await queueZipsFromFiles(s, [notes, corrupt], { width: 512, height: 512, frames: 107, steps: 20 });
 		expect(queued).toBe(0);
 		expect(s.state.queue).toEqual([]);
-		expect(failures.map((f) => f.name)).toEqual(["notes.txt", "corrupt.zip"]);
-		// A non-zip file in a multi-selection is a per-file failure line, not an unhandled error.
+		expect(failures.map((f) => f.name)).toEqual(["notes.md", "corrupt.zip"]);
+		// A non-zip, non-txt file in a multi-selection is a per-file failure line, not an unhandled error.
 		expect(failures[0]?.message).toBe("Please choose a .zip file.");
 		expect(failures[1]?.message).toBe("The file could not be read as a zip archive.");
 	});
@@ -150,9 +167,28 @@ describe("handleZipFiles", () => {
 		expect(s.state.form.zipName).toBe("solo.zip");
 	});
 
+	it("keeps the single-file preview flow for a lone .txt prompt file", async () => {
+		const s = store();
+		await handleZipFiles(s, [new File(["a cat"], "prompt.txt")]);
+		expect(s.state.queue).toEqual([]);
+		expect(s.state.form.parsing).toBe(false);
+		expect(s.state.form.error).toBeNull();
+		expect(s.state.form.analysis?.mode).toBe("prompt");
+		expect(s.state.form.analysis?.prompt).toBe("a cat");
+		expect(s.state.form.zipName).toBe("prompt.txt");
+	});
+
+	it("routes a single empty .txt through the form error (nothing queued)", async () => {
+		const s = store();
+		await handleZipFiles(s, [new File(["  "], "empty.txt")]);
+		expect(s.state.queue).toEqual([]);
+		expect(s.state.form.parsing).toBe(false);
+		expect(s.state.form.error).toBe("prompt.txt is empty; please include a prompt.");
+	});
+
 	it("routes single-file failures through the same door (form error, nothing queued)", async () => {
 		const s = store();
-		await handleZipFiles(s, [new File(["hello"], "notes.txt")]);
+		await handleZipFiles(s, [new File(["hello"], "notes.md")]);
 		expect(s.state.queue).toEqual([]);
 		expect(s.state.form.parsing).toBe(false);
 		expect(s.state.form.error).toBe("Please choose a .zip file.");
@@ -164,6 +200,21 @@ describe("handleZipFiles", () => {
 		expect(s.state.queue).toEqual([]);
 		expect(s.state.form.analysis).toBeNull();
 		expect(s.state.form.parsing).toBe(false);
+	});
+
+	it("queues a multi-selection of only .txt prompt files via the batch path, skipping the preview", async () => {
+		const s = store();
+		stallPump(s);
+		await handleZipFiles(s, [new File(["one"], "a.txt"), new File(["two"], "b.txt"), new File(["three"], "c.txt")]);
+		// The batch path skips the preview and clears the form back to the empty/ready state.
+		expect(s.state.form.analysis).toBeNull();
+		expect(s.state.form.zipName).toBeNull();
+		expect(s.state.form.parsing).toBe(false);
+		expect(s.state.form.error).toBeNull();
+		// pushQueueMany lands newest-first, so the array reads [c, b, a] while the first picked file still runs first (FIFO).
+		expect(s.state.queue.map((i) => i.zipName)).toEqual(["c.txt", "b.txt", "a.txt"]);
+		expect(s.state.queue.map((i) => i.mode)).toEqual(["prompt", "prompt", "prompt"]);
+		expect(s.state.queue.map((i) => i.prompt)).toEqual(["three", "two", "one"]);
 	});
 
 	it("queues a multi-selection, skips the preview, and clears the form back to ready", async () => {
@@ -181,11 +232,11 @@ describe("handleZipFiles", () => {
 	it("queues the valid zips and summarizes the failures in the form error", async () => {
 		const s = store();
 		stallPump(s);
-		await handleZipFiles(s, [zipFile("good.zip", "yay"), new File(["nope"], "bad.zip", { type: "application/zip" }), new File(["x"], "notes.txt")]);
+		await handleZipFiles(s, [zipFile("good.zip", "yay"), new File(["nope"], "bad.zip", { type: "application/zip" }), new File(["x"], "notes.md")]);
 		expect(s.state.queue.map((i) => i.zipName)).toEqual(["good.zip"]);
 		expect(s.state.form.parsing).toBe(false);
 		expect(s.state.form.analysis).toBeNull();
-		expect(s.state.form.error).toBe("Queued 1 of 3 files. Failed: bad.zip — The file could not be read as a zip archive.; notes.txt — Please choose a .zip file.");
+		expect(s.state.form.error).toBe("Queued 1 of 3 files. Failed: bad.zip — The file could not be read as a zip archive.; notes.md — Please choose a .zip file.");
 	});
 
 	it("summarizes a batch where every zip failed", async () => {

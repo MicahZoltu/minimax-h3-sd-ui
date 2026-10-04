@@ -5,8 +5,9 @@
 // Every operation degrades to a no-op when IndexedDB is unavailable (private browsing, security policy), leaving history session-only.
 // This module never rejects; callers treat it as best-effort.
 
-import { isHistoryItem, isQueueItem, type HistoryBackend, type QueueBackend } from "./history.js";
-import { fileKeyPrefix, thumbnailKey, videoKey } from "./media.js";
+import { isHistoryItem, isQueueItem, type HistoryBackend, type HistoryRecordMeta, type QueueBackend } from "./history.js";
+import { thumbnailKey, videoKey } from "./media.js";
+import { predatesCutoff } from "./storageDate.js";
 import type { HistoryItem, QueueItem } from "./types.js";
 
 const DB_NAME = "sdcpp.video";
@@ -96,6 +97,94 @@ function runWrite(run: (history: IDBObjectStore, media: IDBObjectStore) => void)
 	});
 }
 
+// The single per-id removal routine: the record plus its video, thumbnail, and every `<id>:`-prefixed media key (files and reference-video/audio payloads alike) die in one readwrite transaction.
+// Both remove(id) and removeBefore(cutoffMs) delete through this function, so the media cleanup can never diverge between the two paths.
+function removeRecord(id: string): Promise<void> {
+	return runWrite((history, media) => {
+		// Every media key belonging to the id shares the `<id>:` prefix (keys are either exactly `<id>` or `<id>:…`), which this method does not know by count, so a bound range cursor deletes all of them for the id in the same transaction as the rest.
+		// The colon delimiter keeps another item's keys out of the range: a distinct id is never a `<id>:`-prefixed continuation of this one.
+		const range = IDBKeyRange.bound(`${id}:`, `${id}:\uFFFF`);
+		const cursorReq = media.openCursor(range);
+		cursorReq.onsuccess = () => {
+			const cursor = cursorReq.result;
+			if (!cursor) return;
+			cursor.delete();
+			cursor.continue();
+		};
+		void history.delete(id);
+		void media.delete(videoKey(id));
+		void media.delete(thumbnailKey(id));
+	});
+}
+
+// Guard for a raw (unvalidated) IndexedDB record so its createdAt field can be read without a type assertion.
+function isRecordWithCreatedAt(value: unknown): value is { createdAt: unknown } {
+	return typeof value === "object" && value !== null && "createdAt" in value;
+}
+
+// An n-tail deletion orders records by createdAt, so a record whose createdAt is not a finite number is invisible to it (mirroring predatesCutoff's fail-safe).
+function hasFiniteCreatedAt(value: { createdAt: unknown }): value is { createdAt: number } {
+	return typeof value.createdAt === "number" && Number.isFinite(value.createdAt);
+}
+
+// Cursor-collect every persisted record's `{ id, createdAt }` meta so the store can order the whole archive (not just its resident window) for the n-oldest deletion and its count.
+async function collectArchiveMeta(): Promise<HistoryRecordMeta[]> {
+	const db = await database();
+	if (!db) return [];
+	const tx = db.transaction(HISTORY_STORE, "readonly");
+	const metas: HistoryRecordMeta[] = [];
+	await new Promise<void>((resolve) => {
+		try {
+			const cursorReq = tx.objectStore(HISTORY_STORE).openCursor();
+			cursorReq.onsuccess = () => {
+				const cursor = cursorReq.result;
+				if (!cursor) {
+					resolve();
+					return;
+				}
+				const record: unknown = cursor.value;
+				const id = cursor.primaryKey;
+				if (isRecordWithCreatedAt(record) && hasFiniteCreatedAt(record) && typeof id === "string") metas.push({ id, createdAt: record.createdAt });
+				cursor.continue();
+			};
+			cursorReq.onerror = () => resolve();
+		} catch {
+			resolve();
+		}
+	});
+	return metas;
+}
+
+// Cursor-collect the ids of the persisted records matching the shared date predicate.
+async function collectIdsBefore(cutoffMs: number): Promise<string[]> {
+	const db = await database();
+	if (!db) return [];
+	const tx = db.transaction(HISTORY_STORE, "readonly");
+	const ids: string[] = [];
+	await new Promise<void>((resolve) => {
+		try {
+			const cursorReq = tx.objectStore(HISTORY_STORE).openCursor();
+			cursorReq.onsuccess = () => {
+				const cursor = cursorReq.result;
+				if (!cursor) {
+					resolve();
+					return;
+				}
+				const record: unknown = cursor.value;
+				if (isRecordWithCreatedAt(record) && predatesCutoff(record.createdAt, cutoffMs)) {
+					const id = cursor.primaryKey;
+					if (typeof id === "string") ids.push(id);
+				}
+				cursor.continue();
+			};
+			cursorReq.onerror = () => resolve();
+		} catch {
+			resolve();
+		}
+	});
+	return ids;
+}
+
 export function createIdbHistory(): HistoryBackend {
 	return {
 		isPersistent: () => typeof globalThis.indexedDB !== "undefined",
@@ -121,22 +210,36 @@ export function createIdbHistory(): HistoryBackend {
 			});
 		},
 		setViewed,
-		async remove(id: string): Promise<void> {
-			await runWrite((history, media) => {
-				// Per-file blobs live under the fileKeyPrefix of the id, which this method does not know by count, so
-				// a bound range cursor deletes every file key for the id in the same transaction as the rest.
-				const range = IDBKeyRange.bound(fileKeyPrefix(id), `${fileKeyPrefix(id)}\uFFFF`);
-				const cursorReq = media.openCursor(range);
-				cursorReq.onsuccess = () => {
-					const cursor = cursorReq.result;
-					if (!cursor) return;
-					cursor.delete();
-					cursor.continue();
-				};
-				void history.delete(id);
-				void media.delete(videoKey(id));
-				void media.delete(thumbnailKey(id));
+		remove: removeRecord,
+		listArchiveMeta: collectArchiveMeta,
+		async countBefore(cutoffMs: number): Promise<number> {
+			const db = await database();
+			if (!db) return 0;
+			const tx = db.transaction(HISTORY_STORE, "readonly");
+			return await new Promise<number>((resolve) => {
+				try {
+					let count = 0;
+					const cursorReq = tx.objectStore(HISTORY_STORE).openCursor();
+					cursorReq.onsuccess = () => {
+						const cursor = cursorReq.result;
+						if (!cursor) {
+							resolve(count);
+							return;
+						}
+						const record: unknown = cursor.value;
+						if (isRecordWithCreatedAt(record) && predatesCutoff(record.createdAt, cutoffMs)) count += 1;
+						cursor.continue();
+					};
+					cursorReq.onerror = () => resolve(count);
+				} catch {
+					resolve(0);
+				}
 			});
+		},
+		async removeBefore(cutoffMs: number): Promise<void> {
+			// Collect the matching ids first, then delete each through the exact per-id routine, so the media cleanup is identical to remove(id).
+			const ids = await collectIdsBefore(cutoffMs);
+			for (const id of ids) await removeRecord(id);
 		},
 		async clear(): Promise<void> {
 			await runWrite((history, media) => {

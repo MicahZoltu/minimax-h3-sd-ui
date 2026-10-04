@@ -63,7 +63,7 @@ export interface QueueItem {
 	id: string;
 	status: QueueStatus;
 	prompt: string;
-	/** Original uploaded .zip filename, so a source-zip download can restore it. */
+	/** Original uploaded .zip or .txt filename, so a source-zip download can restore it. */
 	zipName: string | null;
 	mode: ZipMode;
 	files: ZipFile[];
@@ -135,7 +135,7 @@ export interface HistoryItem {
 	/** Epoch ms when the item was created (client clock). */
 	createdAt: number;
 	prompt: string;
-	/** Original uploaded .zip filename, so a source-zip download can restore it. */
+	/** Original uploaded .zip or .txt filename, so a source-zip download can restore it. */
 	zipName: string | null;
 	mode: ZipMode;
 	files: PersistedFile[];

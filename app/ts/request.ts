@@ -109,12 +109,12 @@ export function buildVidGenRequest(item: QueueItem): VidGenRequest {
 	// A ref_videos[].audio key is omitted (JSON.stringify drops `undefined`) when the video has no soundtrack.
 	// The `?? []` guards items persisted before reference-video/audio support, which lack these fields.
 	//
-	// A reference video is sampled up to a fixed cap at extraction time, before the form's frame count is known.
-	// Clamp the posted frames to the request's own video_frames, never dropping below the server's 5-frame minimum.
+	// Extraction delivers the whole source (bounded only by the combined 15 s budget), so slicing the posted frames to the request's own video_frames is payload economy, not content loss: the server discards any excess prefix itself, making the clamped and unclamped requests identical.
+	// The clamp never drops below the server's 5-frame minimum.
 	// Extracted frames sit on the 24 fps reference grid and the posted `fps` always describes the delivered frames exactly, so the server's 24 fps normalization is the identity and never duplicates or drops frames.
 	// The soundtrack is trimmed at extraction time to the extracted frames' span; when the form's frame count slices the posted frames below the extracted set, the posted soundtrack can outlast them, which the server absorbs by sizing the prefix block to max(video, audio).
 	const refVideos = (item.videos ?? []).map((v) => {
-		const cap = Math.max(5, Math.min(item.jobFrames, v.frames.length));
+		const cap = refVideoFrameCap(item.jobFrames, v.frames.length);
 		return { frames: v.frames.slice(0, cap), fps: v.fps, ...(v.audio !== null ? { audio: v.audio } : {}) };
 	});
 	const refAudios = (item.audios ?? []).map((a) => a.dataUrl);
@@ -165,6 +165,26 @@ export function buildVidGenRequest(item: QueueItem): VidGenRequest {
 		output_format: GENERATION_PRESET.outputFormat,
 		output_compression: GENERATION_PRESET.outputCompression,
 	};
+}
+
+/**
+ * The number of a reference video's extracted frames a job posts: the job's own frame count, never above what was extracted, never below the server's 5-frame minimum.
+ * Payload economy only — the server discards any excess prefix itself, so the clamp changes nothing the server would compute.
+ */
+export function refVideoFrameCap(jobFrames: number, extractedFrames: number): number {
+	return Math.max(5, Math.min(jobFrames, extractedFrames));
+}
+
+/**
+ * The preview note for one reference video whose extracted frame count outruns the job's frame count (so the request clamps the posted prefix), or null when the whole reference is used.
+ * Worded for the new-job form's preview; the seconds figure is the clamped span at the reference grid's 24 fps.
+ */
+export function refPreviewNote(videoFrames: number, jobFrames: number): string | null {
+	if (!Number.isFinite(videoFrames) || !Number.isFinite(jobFrames)) return null;
+	const cap = refVideoFrameCap(jobFrames, videoFrames);
+	if (cap >= videoFrames) return null;
+	const seconds = (cap / GENERATION_PRESET.fps).toFixed(1);
+	return `Only the first ${seconds} s of this reference conditions a ${jobFrames}-frame generation.`;
 }
 
 /** Map a server output format to a MIME type for playback/download. */

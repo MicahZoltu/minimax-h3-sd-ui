@@ -66,12 +66,12 @@ export function statusLabel(item: QueueItem): string {
 	}
 }
 
-/** The uploaded zip's filename with its trailing .zip extension stripped, or "" when absent. */
+/** The uploaded file's name with its trailing .zip or .txt extension stripped, or "" when absent. */
 export function zipStem(name: string | null): string {
-	return name?.replace(/\.zip$/i, "") ?? "";
+	return name?.replace(/\.(?:zip|txt)$/i, "") ?? "";
 }
 
-/** Human-facing title for a row/item: the zip filename (minus extension), falling back to the prompt then the id. */
+/** Human-facing title for a row/item: the uploaded file's name (minus extension), falling back to the prompt then the id. */
 export function itemTitle(item: { prompt: string; id: string; zipName: string | null }): string {
 	return zipStem(item.zipName) || item.prompt || item.id;
 }

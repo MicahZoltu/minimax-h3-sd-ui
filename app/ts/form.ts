@@ -1,15 +1,16 @@
-// The new-job form DOM builder and the .zip intake that fills it.
+// The new-job form DOM builder and the .zip/.txt intake that fills it.
 // Both take the store as input and neither reaches into any mount-closure transient state.
 //
 // The intake has two entry points.
-// handleZipFile keeps the single-zip preview flow; handleZipFiles routes every pick/drop through the multi-zip batch, where a lone file delegates to the single-zip flow unchanged.
+// handleZipFile keeps the single-file preview flow; handleZipFiles routes every pick/drop through the multi-file batch, where a lone file delegates to the single-file flow unchanged.
 
 import { h, type Child } from "./dom.js";
 import { frameDurationLabel, truncate } from "./format.js";
 import { pump } from "./queue.js";
+import { refPreviewNote } from "./request.js";
 import { FALLBACK_DIMS, type Store } from "./state.js";
 import type { QueueItem } from "./types.js";
-import { analyzeZip } from "./zip.js";
+import { analyzeUpload } from "./zip.js";
 import { dimsError, queueItemFromAnalysis, summarizeZipBatch, type QueueDims, type ZipBatchFailure } from "./queueItem.js";
 
 export function buildForm(store: Store): HTMLElement {
@@ -44,6 +45,9 @@ export function buildForm(store: Store): HTMLElement {
 								f.analysis.videos.map((video) =>
 									h("img", { class: "thumb", src: video.frames[0] ?? "", alt: video.name, title: `Play ${video.name} (${video.frames.length} frames at ${video.fps}fps)`, decoding: "async", "data-action": "view-ref-video", "data-name": video.name }),
 								)),
+							// One visible trim note per video whose extracted frames outrun the form's frame count (hidden when none applies).
+							// Always rendered so updateRefNotes can flip text/visibility in place when the frames field changes without a form re-render.
+							...f.analysis.videos.map((video) => refVideoNoteRow(video.name, video.frames.length, f.frames)),
 						])
 					  : null,
 				  f.analysis.audios.length > 0
@@ -58,11 +62,11 @@ export function buildForm(store: Store): HTMLElement {
 
 	return h("div", { class: "inner" }, [
 		h("h2", {}, "New generation"),
-		h("div", { class: `dropzone ${f.parsing ? "busy" : ""}`, title: f.analysis ? (f.zipName ?? "zip loaded") : "Drop a .zip here or click to choose" }, [
-			h("input", { id: "zipFile", type: "file", accept: ".zip,application/x-zip-compressed,application/zip", class: "hidden", multiple: true }),
+		h("div", { class: `dropzone ${f.parsing ? "busy" : ""}`, title: f.analysis ? (f.zipName ?? "file loaded") : "Drop a .zip or .txt here or click to choose" }, [
+			h("input", { id: "zipFile", type: "file", accept: ".zip,application/x-zip-compressed,application/zip,.txt,text/plain", class: "hidden", multiple: true }),
 			h("div", { class: "dropzone-inner" }, [
-				h("p", { class: "dz-title" }, f.analysis ? "Zip loaded" : "Drop a .zip here"),
-				h("p", { class: "dz-sub" }, f.parsing ? "Reading zip…" : "or click to browse"),
+				h("p", { class: "dz-title" }, f.analysis ? "File loaded" : "Drop a .zip or .txt here"),
+				h("p", { class: "dz-sub" }, f.parsing ? "Reading file…" : "or click to browse"),
 			]),
 		]),
 		...notice,
@@ -102,10 +106,33 @@ export function dimField(label: string, name: string, value: number, aria: strin
 	]);
 }
 
+// One visible trim note for a reference video in the preview, keyed to its video so updateRefNotes can refresh it when the frames field changes.
+// Hidden entirely when no note applies, so the row only appears when the request would clamp the posted prefix.
+function refVideoNoteRow(name: string, videoFrames: number, jobFrames: number): HTMLElement {
+	const note = refPreviewNote(videoFrames, jobFrames);
+	return h("span", { class: "val ref-note", "data-ref-note": name, "data-ref-frames": String(videoFrames), style: note ? "" : "display:none" }, note ?? "");
+}
+
+/**
+ * Refresh the preview's reference-video trim notes in place for a new form frames value.
+ * Typing in the frames field updates state without a form re-render (so focus survives), the same way the frames hint updates in place; this walks the note elements and rewrites their text and visibility from refPreviewNote.
+ * A full form re-render rebuilds the notes from state anyway, so this only needs to cover the live-typing path.
+ */
+export function updateRefNotes(scope: HTMLElement, frames: number): void {
+	for (const el of Array.from(scope.querySelectorAll("[data-ref-note]"))) {
+		if (!(el instanceof HTMLElement)) continue;
+		const videoFrames = Number(el.getAttribute("data-ref-frames"));
+		if (!Number.isFinite(videoFrames)) continue;
+		const note = refPreviewNote(videoFrames, frames);
+		el.textContent = note ?? "";
+		el.style.display = note ? "" : "none";
+	}
+}
+
 async function handleZipFile(store: Store, file: File): Promise<void> {
 	store.setForm({ parsing: true, error: null });
 	try {
-		const analysis = await analyzeZip(file, file.name);
+		const analysis = await analyzeUpload(file);
 		const form = store.state.form;
 		// Prefill dimensions from server defaults only if the user has not customized them (fields are still at the fallback values).
 		const caps = store.state.caps?.defaults_by_mode?.vid_gen;
@@ -122,10 +149,10 @@ async function handleZipFile(store: Store, file: File): Promise<void> {
 }
 
 /**
- * Intake for every picked or dropped zip selection.
+ * Intake for every picked or dropped file selection (zips and plain .txt prompts).
  * A selection arriving while another intake is still parsing is ignored, so two in-flight intakes cannot interleave their form writes.
- * Exactly one file keeps the single-zip preview flow untouched.
- * More than one skips the preview and queues each valid zip with the form's current dimensions, then reports the failures as a single one-line form error while leaving the form empty and ready.
+ * Exactly one file keeps the single-file preview flow untouched.
+ * More than one skips the preview and queues each valid file with the form's current dimensions, then reports the failures as a single one-line form error while leaving the form empty and ready.
  */
 export async function handleZipFiles(store: Store, files: File[]): Promise<void> {
 	// A second pick/drop while a batch (or a single parse) is still in flight must not interleave setForm writes and summaries, so ignore it.
@@ -167,7 +194,7 @@ export async function queueZipsFromFiles(store: Store, files: File[], dims: Queu
 	const items: QueueItem[] = [];
 	for (const file of files) {
 		try {
-			const analysis = await analyzeZip(file, file.name);
+			const analysis = await analyzeUpload(file);
 			items.push(queueItemFromAnalysis(analysis, dims, file.name));
 		} catch (err) {
 			failures.push({ name: file.name, message: err instanceof Error ? err.message : String(err) });

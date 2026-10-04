@@ -12,14 +12,20 @@ export interface ExtractedRefVideo {
 	frames: string[];
 	/** WAV soundtrack data URL, or null when the source container carried no audio. */
 	audio: string | null;
+	/** The source track's display width in px, as provided by the user (before any canvas downscale). */
+	sourceWidth: number;
+	/** The source track's display height in px, as provided by the user (before any canvas downscale). */
+	sourceHeight: number;
+	/** The source's full span in 24 fps reference frames, before any combined-budget cap. */
+	sourceFrames: number;
 }
 
 type RefWorkerRequest =
-	| { type: "video"; id: number; blob: Blob; maxFrames: number; maxWidth: number; quality: number }
+	| { type: "video"; id: number; blob: Blob; maxFrames: number; quality: number }
 	| { type: "audio"; id: number; blob: Blob };
 
 type RefWorkerReply =
-	| { type: "video-result"; id: number; fps: number; frames: string[]; audio: string | null }
+	| { type: "video-result"; id: number; fps: number; frames: string[]; audio: string | null; sourceWidth: number; sourceHeight: number; sourceFrames: number }
 	| { type: "audio-result"; id: number; dataUrl: string }
 	| { type: "error"; id: number; message: string };
 
@@ -68,13 +74,16 @@ function send(request: RefWorkerRequest): Promise<RefWorkerReply> {
 }
 
 /** Decode an uploaded video file into the ordered frame list + fps + soundtrack the request needs. */
-export async function extractRefVideo(blob: Blob, maxFrames: number, maxWidth: number, quality: number): Promise<ExtractedRefVideo> {
-	const reply = await send({ type: "video", id: nextRefId++, blob, maxFrames, maxWidth, quality });
+export async function extractRefVideo(blob: Blob, maxFrames: number, quality: number): Promise<ExtractedRefVideo> {
+	const reply = await send({ type: "video", id: nextRefId++, blob, maxFrames, quality });
 	if (!("type" in reply) || reply.type !== "video-result") throw new Error("Reference video decoding returned an unrecognized response.");
 	if (typeof reply.fps !== "number" || !Number.isFinite(reply.fps) || reply.fps <= 0 || !Number.isInteger(reply.fps)) throw new Error("Reference video reporting an invalid frame rate.");
 	if (!Array.isArray(reply.frames) || reply.frames.some((f) => typeof f !== "string") || reply.frames.length < 1) throw new Error("Reference video produced no decodable frames.");
+	if (typeof reply.sourceWidth !== "number" || !Number.isInteger(reply.sourceWidth) || reply.sourceWidth < 1) throw new Error("Reference video reported invalid source dimensions.");
+	if (typeof reply.sourceHeight !== "number" || !Number.isInteger(reply.sourceHeight) || reply.sourceHeight < 1) throw new Error("Reference video reported invalid source dimensions.");
+	if (typeof reply.sourceFrames !== "number" || !Number.isInteger(reply.sourceFrames) || reply.sourceFrames < 0) throw new Error("Reference video reported an invalid source frame count.");
 	const audio = typeof reply.audio === "string" ? reply.audio : null;
-	return { fps: reply.fps, frames: reply.frames, audio };
+	return { fps: reply.fps, frames: reply.frames, audio, sourceWidth: reply.sourceWidth, sourceHeight: reply.sourceHeight, sourceFrames: reply.sourceFrames };
 }
 
 /** Decode an uploaded audio file into a WAV data URL (passed through unmodified when it is already WAV). */

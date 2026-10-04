@@ -4,6 +4,7 @@
 
 export const isHTMLElement = (el: unknown): el is HTMLElement => el instanceof HTMLElement;
 export const isInputElement = (el: unknown): el is HTMLInputElement => el instanceof HTMLInputElement;
+export const isButtonElement = (el: unknown): el is HTMLButtonElement => el instanceof HTMLButtonElement;
 export const isVideoElement = (el: unknown): el is HTMLVideoElement => el instanceof HTMLVideoElement;
 
 export function requiredElement<T extends Element>(el: unknown, guard: (el: unknown) => el is T, what: string): T {

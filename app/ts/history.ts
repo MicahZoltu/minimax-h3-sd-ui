@@ -8,6 +8,7 @@
 // This module also owns the queue persistence backend contract and the storage-usage estimator.
 
 import { fileKey, refAudioKey, refVideoAudioKey, refVideoSourceKey, refVideoThumbKey, thumbnailKey, videoKey } from "./media.js";
+import { dateCutoffCount, predatesCutoff } from "./storageDate.js";
 import type { HistoryItem, QueueItem, QueueStatus, RefAudioFile, RefVideoFile, ZipMode } from "./types.js";
 
 export interface SyncStorage {
@@ -137,17 +138,33 @@ export interface HistoryMedia {
 	audioSources: Blob[];
 }
 
+/** The `{ id, createdAt }` pair a backend scan exposes so the store can order the whole archive without loading full items. */
+export interface HistoryRecordMeta {
+	id: string;
+	createdAt: number;
+}
+
 export interface HistoryBackend {
 	/** Sync hint about whether durable storage is available at all. */
 	isPersistent(): boolean;
 	/** Return every persisted item, or an empty array on any failure. */
 	loadAll(): Promise<HistoryItem[]>;
+	/**
+	 * Every persisted record's id + createdAt meta, or an empty array on any failure.
+	 * The archive-wide ordering surface: it sees past the in-memory cap, so the store can pick the oldest victims across the whole archive.
+	 * A record whose createdAt is not a finite number is invisible here (its age is unknown), mirroring predatesCutoff's fail-safe.
+	 */
+	listArchiveMeta(): Promise<HistoryRecordMeta[]>;
 	save(item: HistoryItem, videoBlob: Blob): Promise<void>;
 	/** Persist a single media Blob (thumbnail, input file, or reference-video/audio payload) under its media-store key. */
 	storeMedia(key: string, blob: Blob): Promise<void>;
 	/** Update only an item's `viewed` field on the history object store key, not the whole record. */
 	setViewed(id: string, viewed: boolean): Promise<void>;
 	remove(id: string): Promise<void>;
+	/** Count every persisted record strictly older than the epoch-ms cutoff (the shared predicate; a non-finite createdAt never matches). */
+	countBefore(cutoffMs: number): Promise<number>;
+	/** Remove every persisted record strictly older than the epoch-ms cutoff along with its media. */
+	removeBefore(cutoffMs: number): Promise<void>;
 	clear(): Promise<void>;
 	loadMedia(key: string): Promise<Blob | null>;
 }
@@ -158,7 +175,25 @@ export interface HistoryStore {
 	/** Mark an item viewed (persist best-effort); a no-op when it is already viewed. */
 	markViewed(id: string): void;
 	remove(id: string): void;
-	removeOldest(count: number): void;
+	/**
+	 * Delete the `count` oldest items across the ENTIRE persisted archive, not just the residents: the union of every persisted archive record and every resident (deduped by id) is sorted oldest-first and the first `count` ids die.
+	 * Residents go through the same remove() path as a manual delete; non-residents go through the backend's per-id removal plus the memory-side media-cache eviction.
+	 * An item whose createdAt is not finite is never a candidate (its age is unknown — the same fail-safe predatesCutoff applies to date deletions), so such an item effectively shrinks `count`.
+	 * Returns the deleted ids; emits nothing (the state wrapper owns the single `history` emit).
+	 */
+	removeOldest(count: number): Promise<string[]>;
+	/**
+	 * Delete every item strictly older than the epoch-ms cutoff, resident and archived alike.
+	 * Resident matches go through the same remove() path as a manual delete; the backend sweep covers the evicted (non-resident) tail of the archive.
+	 */
+	removeBefore(cutoffMs: number): Promise<void>;
+	/**
+	 * Count exactly what removeBefore would delete: the backend's archive-wide match count plus the resident matches that are absent from the backend.
+	 * A resident item is absent from the backend exactly when its save failed (`persisted === false`); the flag flips optimistically before the save resolves, so an in-flight record is never double-counted against the archive copy the same save writes.
+	 */
+	countBefore(cutoffMs: number): Promise<number>;
+	/** Count every item removeOldest can act on: the same archive-wide union, resident and evicted alike. */
+	countAll(): Promise<number>;
 	clear(): void;
 	isPersistent(): boolean;
 	loadVideo(id: string): Promise<Blob | null>;
@@ -179,6 +214,8 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 	// It backs the non-persistent path (private browsing / failed writes must still show images) and
 	// serves repeated reads of the same key without a second backend hit while the session is alive.
 	const mediaCache = new Map<string, Blob | null>();
+	// Items spliced out by trimMemory's cap eviction, distinct from deleted ones: an evicted item's record stays in the archive, so its media must keep persisting to it.
+	const evictedItems = new WeakSet<HistoryItem>();
 
 	const cacheMedia = (key: string, blob: Blob | null): void => {
 		mediaCache.set(key, blob);
@@ -205,31 +242,42 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 
 	async function persistItem(item: HistoryItem, media: HistoryMedia): Promise<void> {
 		if (!backend) return;
+		// An item deleted mid-save must stop writing as soon as it is noticed gone, so a delete never overtakes the save and leaves transient orphan blobs behind.
+		// An item merely evicted over the in-memory cap is NOT gone in this sense: its record stays in the archive, so its media must too.
+		const gone = (): boolean => !items.includes(item) && !evictedItems.has(item);
 		try {
-			await backend.save(item, media.video);
+			// The flag flips optimistically BEFORE the backend save resolves, so countBefore never double-counts the in-flight resident (as "non-persisted") against the archive copy its own save is writing.
 			item.persisted = true;
+			await backend.save(item, media.video);
 		} catch {
 			// Best-effort: a failed write leaves the item session-only rather than missing from the running list.
 			item.persisted = false;
 			return;
 		}
+		if (gone()) return;
 		try {
 			await backend.storeMedia(thumbnailKey(item.id), media.thumbnail);
+			if (gone()) return;
 			for (let i = 0; i < media.files.length; i++) {
 				const blob = media.files[i];
 				if (blob) await backend.storeMedia(fileKey(item.id, i), blob);
+				if (gone()) return;
 			}
 			for (let i = 0; i < media.videoThumbs.length; i++) {
 				const thumb = media.videoThumbs[i];
 				const audio = media.videoAudios[i];
 				const source = media.videoSources[i];
 				if (thumb) await backend.storeMedia(refVideoThumbKey(item.id, i), thumb);
+				if (gone()) return;
 				if (audio) await backend.storeMedia(refVideoAudioKey(item.id, i), audio);
+				if (gone()) return;
 				if (source) await backend.storeMedia(refVideoSourceKey(item.id, i), source);
+				if (gone()) return;
 			}
 			for (let i = 0; i < media.audioSources.length; i++) {
 				const source = media.audioSources[i];
 				if (source) await backend.storeMedia(refAudioKey(item.id, i), source);
+				if (gone()) return;
 			}
 		} catch {
 			// A failed media write is also best-effort; the record still persists and media degrades to a placeholder.
@@ -244,12 +292,32 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 		if (excess <= 0) return;
 		const evicted = items.slice(0, excess);
 		for (const item of evicted) {
+			evictedItems.add(item);
 			evictItemMedia(item.id);
 			// Surface the eviction so a caller can release the store "resident" object URL / Blob
 			// when the item currently shown full-size leaves memory (otherwise it leaks for the session).
 			onEvictItem?.(item.id);
 		}
 		items.splice(0, excess);
+	}
+
+	// Enumerates the item universe every archive-wide n-oldest deletion (and its count) acts on: each persisted archive record plus every resident.
+	// A resident cannot be assumed to sit inside the archive scan (its save may be in flight, failed, or degraded to a no-op), so residents join explicitly; an id present on both sides collapses to one entry, so an item is never counted or deleted twice.
+	// An item with a non-finite createdAt is excluded: like predatesCutoff's fail-safe, an item of unknown age is never silently consumed by an n-tail deletion.
+	async function archiveUnion(): Promise<HistoryRecordMeta[]> {
+		const byId = new Map<string, HistoryRecordMeta>();
+		if (backend) {
+			try {
+				for (const meta of await backend.listArchiveMeta()) byId.set(meta.id, meta);
+			} catch {
+				// A failed scan degrades to the resident view alone; deletion never blocks on it.
+			}
+		}
+		for (const it of items) {
+			if (!Number.isFinite(it.createdAt)) continue;
+			byId.set(it.id, { id: it.id, createdAt: it.createdAt });
+		}
+		return [...byId.values()];
 	}
 
 	return {
@@ -330,11 +398,48 @@ export function createHistoryStore(backend: HistoryBackend | null, onEvictItem?:
 				});
 			}
 		},
-		removeOldest(count: number): void {
+		async removeOldest(count: number): Promise<string[]> {
 			const n = Number.isFinite(count) ? Math.floor(count) : 0;
-			if (n <= 0) return;
-			const oldest = [...items].sort((a, b) => a.createdAt - b.createdAt).slice(0, n);
-			for (const it of oldest) this.remove(it.id);
+			if (n <= 0) return [];
+			// The union is sorted oldest-first; the first n ids are the victims whether they are residents or evicted archive-only items.
+			const union = await archiveUnion();
+			union.sort((a, b) => a.createdAt - b.createdAt);
+			const victims = union.slice(0, n);
+			const residentIds = new Set(items.map((i) => i.id));
+			for (const victim of victims) {
+				if (residentIds.has(victim.id)) {
+					// A resident dies through the exact remove() path so the splice, media eviction, and per-id backend removal all stay correct.
+					this.remove(victim.id);
+				} else {
+					// An evicted (non-resident) victim dies through the backend's per-id removal, and its media blobs are dropped from the memory-side cache so no stale Blob survives.
+					evictItemMedia(victim.id);
+					if (backend) await backend.remove(victim.id);
+				}
+			}
+			return victims.map((v) => v.id);
+		},
+		async removeBefore(cutoffMs: number): Promise<void> {
+			// Resident matches go through the exact remove() path so media eviction, cache clearing, and the per-id backend removal all stay correct.
+			const residentMatches = items.filter((it) => predatesCutoff(it.createdAt, cutoffMs));
+			for (const it of residentMatches) this.remove(it.id);
+			// The backend sweep covers the evicted (non-resident) tail of the archive; already-removed ids delete idempotently.
+			if (backend) await backend.removeBefore(cutoffMs);
+		},
+		async countBefore(cutoffMs: number): Promise<number> {
+			// Only the resident matches that are absent from the backend are added here; the persisted ones are already inside the backend's own count.
+			const nonPersistedMatches = dateCutoffCount(items.filter((it) => !it.persisted), cutoffMs);
+			if (!backend) return nonPersistedMatches;
+			let archiveCount = 0;
+			try {
+				archiveCount = await backend.countBefore(cutoffMs);
+			} catch {
+				archiveCount = 0;
+			}
+			return archiveCount + nonPersistedMatches;
+		},
+		async countAll(): Promise<number> {
+			// Exactly the universe removeOldest draws from, so the delete-oldest control's readout can neither promise more nor less than the deletion delivers.
+			return (await archiveUnion()).length;
 		},
 		clear(): void {
 			items.length = 0;

@@ -158,6 +158,47 @@ describe("capability defaults", () => {
 			(globalThis as { fetch: typeof fetch }).fetch = originalFetch;
 		}
 	});
+
+	it("fetchCapabilities notifies the queue domain exactly when vidProgress flips (a resumed row can gain or lose its progress bar)", async () => {
+		const originalFetch = globalThis.fetch;
+		let advertiseProgress = true;
+		(globalThis as unknown as { fetch: typeof fetch }).fetch = (async () => new Response(JSON.stringify(advertiseProgress ? { features_by_mode: { vid_gen: { progress: true } } } : {}), { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch;
+		try {
+			const store = createStore(memoryQueueBackend());
+			await store.queueReady;
+			let queueCalls = 0;
+			store.subscribe(() => { queueCalls += 1; }, ["queue"]);
+			// Baseline: the hydration merge has already made its own single queue bump by the time queueReady resolves.
+			const baseRev = store.revs.queue;
+
+			// First successful probe: vidProgress flips false -> true, so the queue domain must be notified.
+			// This is what lets a job resumed before the first caps probe rebuild its row with a live bar:
+			// the row's reconcile signature carries progressOk, so the notified render rebuilds only that row.
+			await store.fetchCapabilities();
+			expect(store.state.vidProgress).toBe(true);
+			expect(store.revs.queue).toBe(baseRev + 1);
+			expect(queueCalls).toBe(1);
+
+			// A repeat probe with the flag already known is not a flip: the periodic probe must not re-render the queue.
+			await store.fetchCapabilities();
+			expect(store.revs.queue).toBe(baseRev + 1);
+			expect(queueCalls).toBe(1);
+
+			// A flip back (the server lost the feature) must notify again, so the bar is removed.
+			advertiseProgress = false;
+			await store.fetchCapabilities();
+			expect(store.state.vidProgress).toBe(false);
+			expect(store.revs.queue).toBe(baseRev + 2);
+			expect(queueCalls).toBe(2);
+
+			// Still no feature advertised: no flip, no notification.
+			await store.fetchCapabilities();
+			expect(store.revs.queue).toBe(baseRev + 2);
+			expect(queueCalls).toBe(2);
+		} finally {
+			(globalThis as { fetch: typeof fetch }).fetch = originalFetch;
+		}
+	});
 });
 
 describe("resident supersession", () => {
@@ -208,5 +249,58 @@ describe("resident eviction", () => {
 		expect(store.residentBlob()).toBeNull();
 		// The eviction must have revoked the resident's object URL.
 		expect(revoked).toContain(residentUrl);
+	});
+});
+
+describe("date-based history deletion", () => {
+	it("removeHistoryBefore emits history once and clears the resident when it is removed", async () => {
+		const store = createStore(memoryQueueBackend());
+		// Let the store's initial async history hydration emit before counting emissions.
+		await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+		store.addHistory({ ...historyItem("a"), createdAt: 1000 }, media());
+		store.addHistory({ ...historyItem("b"), createdAt: 2000 }, media());
+		await store.setResident("a", new Blob(["vid"]));
+		expect(store.residentId()).toBe("a");
+
+		let historyCalls = 0;
+		store.subscribe(() => { historyCalls += 1; }, ["history"]);
+
+		await store.removeHistoryBefore(2000);
+		expect(historyCalls).toBe(1);
+		// The boundary item (createdAt === cutoff) survives.
+		expect(store.history.items().map((i) => i.id)).toEqual(["b"]);
+		expect(store.residentId()).toBeNull();
+	});
+});
+
+describe("oldest-based history deletion", () => {
+	it("removeOldestHistory emits history once and clears the resident when it is removed", async () => {
+		const store = createStore(memoryQueueBackend());
+		// Let the store's initial async history hydration emit before counting emissions.
+		await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+		store.addHistory({ ...historyItem("a"), createdAt: 1000 }, media());
+		store.addHistory({ ...historyItem("b"), createdAt: 2000 }, media());
+		await store.setResident("a", new Blob(["vid"]));
+		expect(store.residentId()).toBe("a");
+
+		let historyCalls = 0;
+		store.subscribe(() => { historyCalls += 1; }, ["history"]);
+
+		const removed = await store.removeOldestHistory(1);
+		expect(removed).toEqual(["a"]);
+		expect(historyCalls).toBe(1);
+		expect(store.history.items().map((i) => i.id)).toEqual(["b"]);
+		expect(store.residentId()).toBeNull();
+	});
+
+	it("countHistory reflects the archive union the delete-oldest control acts on", async () => {
+		const store = createStore(memoryQueueBackend());
+		// Let the store's initial async history hydration emit before counting.
+		await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+		store.addHistory(historyItem("a"), media());
+		store.addHistory(historyItem("b"), media());
+		expect(await store.countHistory()).toBe(2);
+		await store.removeOldestHistory(1);
+		expect(await store.countHistory()).toBe(1);
 	});
 });

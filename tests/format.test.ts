@@ -92,8 +92,20 @@ describe("zipStem / itemTitle", () => {
 		expect(zipStem(null)).toBe("");
 	});
 
+	it("strips a trailing .txt extension too, case-insensitively", () => {
+		expect(zipStem("notes.txt")).toBe("notes");
+		expect(zipStem("notes.TXT")).toBe("notes");
+		expect(zipStem("job.zip")).toBe("job");
+	});
+
+	it("strips only the trailing extension so doubled names keep their stem", () => {
+		expect(zipStem("weird.txt.zip")).toBe("weird.txt");
+		expect(zipStem("a.zip.txt")).toBe("a.zip");
+	});
+
 	it("falls back from the zip name to the prompt to the id", () => {
 		expect(itemTitle({ prompt: "p", id: "q_1", zipName: "intro.zip" })).toBe("intro");
+		expect(itemTitle({ prompt: "p", id: "q_1", zipName: "notes.txt" })).toBe("notes");
 		expect(itemTitle({ prompt: "p", id: "q_1", zipName: null })).toBe("p");
 		expect(itemTitle({ prompt: "", id: "q_1", zipName: null })).toBe("q_1");
 	});

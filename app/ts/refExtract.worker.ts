@@ -1,6 +1,7 @@
 // Web Worker entry for referencing media extraction.
 // Receives protocol messages from the main thread and derives the frame list / fps / soundtrack a video reference ingestion needs.
 // Frames are sampled onto the 24 fps reference grid planned by refExtract.plan.js, so the reported fps always describes the delivered frames exactly.
+// Delivered frames are never trimmed to a fixed cap or upscaled: the source is delivered whole (the caller bounds it with the remaining combined budget as maxFrames), and rendering applies only the server's own reference canvas downscale from refExtract.plan.js.
 // Mirrors the message shapes defined locally in refExtract.ts (they are not exported there).
 // Exports nothing; wiring self.onmessage on load is the whole point.
 
@@ -13,15 +14,15 @@ import { WavOutputFormat } from "../vendor/mediabunny/src/output-format.js";
 import { Output } from "../vendor/mediabunny/src/output.js";
 import { BlobSource } from "../vendor/mediabunny/src/source.js";
 import { BufferTarget } from "../vendor/mediabunny/src/target.js";
-import { REF_VIDEO_FPS, planReferenceSampling } from "./refExtract.plan.js";
+import { REF_VIDEO_FPS, planReferenceSampling, refCanvasSize, referenceFrameCount } from "./refExtract.plan.js";
 
 // The worker half of the protocol. Types are local to refExtract.ts, so they are mirrored verbatim here.
 type RefWorkerRequest =
-	| { type: "video"; id: number; blob: Blob; maxFrames: number; maxWidth: number; quality: number }
+	| { type: "video"; id: number; blob: Blob; maxFrames: number; quality: number }
 	| { type: "audio"; id: number; blob: Blob };
 
 type RefWorkerReply =
-	| { type: "video-result"; id: number; fps: number; frames: string[]; audio: string | null }
+	| { type: "video-result"; id: number; fps: number; frames: string[]; audio: string | null; sourceWidth: number; sourceHeight: number; sourceFrames: number }
 	| { type: "audio-result"; id: number; dataUrl: string }
 	| { type: "error"; id: number; message: string };
 
@@ -53,16 +54,10 @@ function bufferToDataUrl(buffer: ArrayBuffer, mime: string): string {
 	return `data:${mime};base64,${btoa(chunks.join(""))}`;
 }
 
-function downscaled(trackWidth: number, trackHeight: number, maxWidth: number): { width: number; height: number } {
-	const width = Math.max(1, Math.floor(maxWidth));
-	if (trackWidth <= 0 || trackHeight <= 0) return { width, height: Math.max(1, Math.floor(maxWidth)) };
-	const scale = Math.min(1, width / trackWidth);
-	return { width: Math.max(1, Math.round(trackWidth * scale)), height: Math.max(1, Math.round(trackHeight * scale)) };
-}
-
-async function renderToJpeg(wrapped: WrappedCanvas, maxWidth: number, quality: number): Promise<string | null> {
+async function renderToJpeg(wrapped: WrappedCanvas, quality: number): Promise<string | null> {
 	const source = wrapped.canvas;
-	const dims = downscaled(source.width, source.height, maxWidth);
+	// The frame is drawn at the server's reference canvas size: sources at or below the canvas are drawn 1:1 at their native pixel grid, and only a larger source is downscaled (never beyond the canvas, never upscaled).
+	const dims = refCanvasSize(source.width, source.height);
 	const canvas = new OffscreenCanvas(dims.width, dims.height);
 	const context = canvas.getContext("2d");
 	if (!context) return null;
@@ -73,13 +68,13 @@ async function renderToJpeg(wrapped: WrappedCanvas, maxWidth: number, quality: n
 
 // Renders one JPEG data URL per planned sample timestamp, in presentation order.
 // Each grid point shows the frame displayed at that instant, so the delivered count equals the plan's length unless the decoder falls short, and every delivered frame sits on the grid the reported fps describes.
-async function extractFrames(videoTrack: InputVideoTrack, timestamps: number[], maxWidth: number, quality: number): Promise<string[]> {
+async function extractFrames(videoTrack: InputVideoTrack, timestamps: number[], quality: number): Promise<string[]> {
 	const sink = new CanvasSink(videoTrack);
 	const frames: string[] = [];
 	for await (const wrapped of sink.canvasesAtTimestamps(timestamps)) {
 		// A null entry means the decoder fell short of the requested timestamp, or the timestamp precedes the first frame, so there is no frame to render there.
 		if (!wrapped) continue;
-		const dataUrl = await renderToJpeg(wrapped, maxWidth, quality);
+		const dataUrl = await renderToJpeg(wrapped, quality);
 		if (dataUrl) frames.push(dataUrl);
 	}
 	if (frames.length === 0) throw new Error("The video produced no decodable frames.");
@@ -115,7 +110,7 @@ async function extractVideoAudio(blob: Blob, start: number, end: number): Promis
 }
 
 async function handleVideo(request: VideoRequest): Promise<void> {
-	const { id, blob, maxFrames, maxWidth, quality } = request;
+	const { id, blob, maxFrames, quality } = request;
 	if (typeof globalThis.VideoDecoder !== "function") {
 		scope.postMessage({ type: "error", id, message: "Video decoding requires WebCodecs VideoDecoder, which is unavailable in this browser." });
 		return;
@@ -125,15 +120,19 @@ async function handleVideo(request: VideoRequest): Promise<void> {
 	try {
 		const videoTrack = await input.getPrimaryVideoTrack();
 		if (!videoTrack) throw new Error("The video has no decodable video track.");
+		// The source's display dimensions are what the user provided; they are reported back so the main thread can enforce the documented resolution range on the SOURCE, independent of the canvas downscale applied below.
+		const sourceWidth = await videoTrack.getDisplayWidth();
+		const sourceHeight = await videoTrack.getDisplayHeight();
 		const firstTimestamp = Math.max(0, await videoTrack.getFirstTimestamp());
 		// computeDuration returns the END timestamp of the last packet, not the container's nominal duration, so `end - firstTimestamp` is the true frame span the plan resamples onto the 24 fps grid.
 		const end = await videoTrack.computeDuration({ skipLiveWait: true });
 		const plan = planReferenceSampling(firstTimestamp, end, target);
-		const frames = await extractFrames(videoTrack, plan, maxWidth, quality);
+		const frames = await extractFrames(videoTrack, plan, quality);
 		// The soundtrack is trimmed to the span the delivered frames cover, so its length can never outgrow the video prefix on the server (the server's block timeline is max(video, audio)).
 		// extractFrames throws before this line when nothing decoded, so `frames.length` is >= 1 here.
 		const audio = await extractVideoAudio(blob, firstTimestamp, firstTimestamp + frames.length / REF_VIDEO_FPS);
-		scope.postMessage({ type: "video-result", id, fps: REF_VIDEO_FPS, frames, audio });
+		// The uncapped whole-source frame count is reported alongside the delivery so the main thread's combined-budget check can see a budget-capped extraction for what it is (an upload that must error) instead of silently accepting the trimmed prefix.
+		scope.postMessage({ type: "video-result", id, fps: REF_VIDEO_FPS, frames, audio, sourceWidth, sourceHeight, sourceFrames: referenceFrameCount(firstTimestamp, end) });
 	} finally {
 		input.dispose();
 	}

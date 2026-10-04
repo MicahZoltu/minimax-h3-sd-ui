@@ -9,9 +9,9 @@ import { h, clear } from "./dom.js";
 import { downloadBlob } from "./download.js";
 import { setupDragReorder } from "./dragReorder.js";
 import { setupFavicon } from "./favicon.js";
-import { buildForm, handleZipFiles } from "./form.js";
+import { buildForm, handleZipFiles, updateRefNotes } from "./form.js";
 import { buildHeader } from "./header.js";
-import { formatBytes, frameDurationLabel } from "./format.js";
+import { formatBytes, frameDurationLabel, zipStem } from "./format.js";
 import { buildHistoryRowSpecs, buildRowMedia } from "./historyList.js";
 import { estimateStorage } from "./history.js";
 import { createLightbox } from "./lightbox.js";
@@ -21,7 +21,7 @@ import { pump } from "./queue.js";
 import { buildQueueRowSpecs, moveQueueItem, updateLive } from "./queueList.js";
 import { dimsError, queueItemFromAnalysis, type QueueDims } from "./queueItem.js";
 import type { Store } from "./state.js";
-import { buildStorageModal } from "./storage.js";
+import { buildStorageModal, type StorageModalHandle } from "./storage.js";
 import { buildSourceZip } from "./zip.js";
 
 // History details that are loading (or loaded) their file thumbs, so a quick close/re-open does not double-load.
@@ -36,6 +36,8 @@ export function mount(store: Store, root: HTMLElement): void {
 	let lastResidentId: string | null = null;
 
 	let storageModalOpen = false;
+	// The modal handle is built once per open and then patched in place, so the number and date inputs survive every poll/emit with their value and focus intact.
+	let storageModal: StorageModalHandle | null = null;
 	let lastEstimate: { usage: number; quota: number } | null = null;
 	let storageMeterRefreshing = false;
 
@@ -82,15 +84,64 @@ export function mount(store: Store, root: HTMLElement): void {
 		}
 	};
 	const renderStorageModal = (): void => {
-		clear(storageRootEl);
 		if (!storageModalOpen) {
+			if (storageModal) {
+				clear(storageRootEl);
+				storageModal = null;
+			}
 			storageRootEl.style.display = "none";
 			return;
 		}
-		storageRootEl.style.display = "block";
-		const usage = lastEstimate?.usage ?? 0;
-		const quota = lastEstimate?.quota ?? 0;
-		storageRootEl.appendChild(buildStorageModal(store, usage, quota));
+		if (!storageModal) {
+			// A fresh build on every open, so a previously typed number or chosen date never leaks into the new session.
+			clear(storageRootEl);
+			storageModal = buildStorageModal(store, lastEstimate?.usage ?? 0, lastEstimate?.quota ?? 0);
+			storageRootEl.appendChild(storageModal.el);
+			storageRootEl.style.display = "block";
+			return;
+		}
+		storageModal.update(lastEstimate?.usage ?? 0, lastEstimate?.quota ?? 0);
+	};
+
+	// The storage modal's destructive arms live beside the modal handle so they can consult the painted preview and refresh the modal via the update path.
+	const armDeleteOldest = (): void => {
+		const input = maybeElement(storageRootEl.querySelector("[data-delete-oldest-count]"), isInputElement);
+		if (!input) return;
+		const n = Number(input.value);
+		if (!Number.isFinite(n) || n < 1) return;
+		// The archive-wide deletion is async, so the button is disabled until it settles: a double-click must not queue a second deletion with a stale n (the same guard the date arm uses).
+		// No resident clamp: the deletion targets the whole archive, and the store naturally caps the victims at what the archive holds.
+		const modal = storageModal;
+		modal?.setDeleteOldestBusy(true);
+		void store.removeOldestHistory(Math.floor(n)).then(() => {
+			void refreshStorageMeter();
+		}).catch(() => {}).finally(() => {
+			modal?.setDeleteOldestBusy(false);
+			// An evicted-only deletion leaves every resident in place, so the emit-driven repaint gate sees an unchanged signature and would never re-scan; force both readouts against the shrunken archive instead.
+			// When the emit path also fires its gated scan, the generation counter discards the loser (a redundant scan is fine; a stale paint is not).
+			modal?.refreshArchiveCount();
+			modal?.refreshPreview();
+		});
+	};
+	const armDeleteBefore = (): void => {
+		const armed = storageModal?.deleteBeforePreview();
+		if (!armed || armed.count <= 0) return;
+		if (!window.confirm(`Delete ${armed.count} generations before ${armed.date}? This cannot be undone.`)) return;
+		const modal = storageModal;
+		modal?.setDeleteBeforeBusy(true);
+		void store.removeHistoryBefore(armed.cutoffMs).then(() => {
+			void refreshStorageMeter();
+		}).catch(() => {}).finally(() => {
+			modal?.setDeleteBeforeBusy(false);
+			// Same forced re-resolve as the delete-oldest arm: the archive shrank, and an evicted-only sweep leaves the repaint gate's signature untouched.
+			modal?.refreshArchiveCount();
+			modal?.refreshPreview();
+		});
+	};
+	const armClearHistory = (): void => {
+		if (!window.confirm("Clear all saved history? This cannot be undone.")) return;
+		store.clearHistory();
+		void refreshStorageMeter();
 	};
 
 	const header = buildHeader(store);
@@ -224,6 +275,12 @@ export function mount(store: Store, root: HTMLElement): void {
 			event.stopPropagation();
 			codecModalOpen = false;
 			renderCodecModal();
+		} else if (action === "delete-oldest") {
+			armDeleteOldest();
+		} else if (action === "delete-before") {
+			armDeleteBefore();
+		} else if (action === "clear-history") {
+			armClearHistory();
 		} else if (action !== null) {
 			// All remaining arms (image/video open, downloads, cancel, close) belong to the lightbox module.
 			box.handleAction(action, { event, element: actionEl });
@@ -387,19 +444,6 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 			case "delete-history":
 				store.removeHistory(id);
 				break;
-			case "delete-oldest": {
-				const input = maybeElement(root.querySelector("[data-delete-oldest-count]"), isInputElement);
-				if (!input) break;
-				const n = Number(input.value);
-				if (!Number.isFinite(n) || n < 1) break;
-				store.removeOldestHistory(Math.floor(n));
-				break;
-			}
-			case "clear-history":
-				if (window.confirm("Clear all saved history? This cannot be undone.")) {
-					store.clearHistory();
-				}
-				break;
 			case "download-zip":
 				void downloadSourceZip(store, id);
 				break;
@@ -516,7 +560,7 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 		}
 	});
 
-	// Dropping a zip onto the drop zone (capture so re-rendered zones work).
+	// Dropping a .zip or .txt onto the drop zone (capture so re-rendered zones work).
 	root.addEventListener(
 		"dragover",
 		(event) => {
@@ -526,8 +570,8 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 		},
 		true,
 	);
-	// Dropping zip(s) onto the drop zone (capture so re-rendered zones work).
-	// Every drop routes through the multi-file intake, so a lone file keeps the single-zip preview flow.
+	// Dropping zip(s) or .txt file(s) onto the drop zone (capture so re-rendered zones work).
+	// Every drop routes through the multi-file intake, so a lone file keeps the single-file preview flow.
 	root.addEventListener(
 		"drop",
 		(event) => {
@@ -541,7 +585,7 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 	);
 
 	// Read picked files (change bubbles from the hidden input).
-	// Every selection routes through the multi-file intake, so a lone file keeps the single-zip preview flow.
+	// Every selection routes through the multi-file intake, so a lone file keeps the single-file preview flow.
 	root.addEventListener("change", (event) => {
 		const target = maybeElement(event.target, isInputElement);
 		if (!target || target.id !== "zipFile") return;
@@ -563,6 +607,8 @@ function setupDelegated(store: Store, root: HTMLElement, batch: BatchDownloadHan
 			if (name === "frames") {
 				const hint = root.querySelector('[data-dim-hint="frames"]');
 				if (hint) hint.textContent = frameDurationLabel(value);
+				// The preview's reference-video trim notes read the form's frame count; refresh them in place alongside the hint (no re-render, so focus survives).
+				updateRefNotes(root, value);
 			}
 		}
 	});
@@ -572,7 +618,7 @@ function addToQueue(store: Store): void {
 	const f = store.state.form;
 	const analysis = f.analysis;
 	if (!analysis) {
-		store.setForm({ error: "Upload a .zip first." });
+		store.setForm({ error: "Upload a .zip or .txt first." });
 		return;
 	}
 	// The Number() wrap mirrors the historical read, and the shared validator keeps its exact messages and check order.
@@ -605,5 +651,5 @@ async function downloadSourceZip(store: Store, id: string): Promise<void> {
 	for (const video of item.videos ?? []) await pushSource(video.name, video.sourceKey);
 	for (const audio of item.audios ?? []) await pushSource(audio.name, audio.key);
 	const blob = buildSourceZip(source, item.prompt);
-	downloadBlob(blob, item.zipName ?? `${id}.zip`);
+	downloadBlob(blob, `${zipStem(item.zipName) || id}.zip`);
 }

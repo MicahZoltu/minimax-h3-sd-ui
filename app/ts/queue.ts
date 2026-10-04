@@ -42,7 +42,9 @@ export function resumeActiveJobs(store: Store): void {
 		if (item.status !== "submitting" && item.status !== "generating") continue;
 		if (item.serverId) {
 			// Continue the queue once the resumed job reaches a terminal state.
-			void pollUntilTerminal(store, item.id, item.serverId, "generation lost due to page refresh").then(() => void pump(store)).catch(() => {});
+			// The first poll is immediate: the persisted job has long been running, so waiting a poll tick
+			// before the first GET would only delay the refreshed page's re-attachment (and its progress bar).
+			void pollUntilTerminal(store, item.id, item.serverId, "generation lost due to page refresh", { immediate: true }).then(() => void pump(store)).catch(() => {});
 		} else {
 			store.patchQueueItem(item.id, { status: "failed", error: "generation lost due to page refresh" });
 		}
@@ -115,10 +117,23 @@ async function submitWithRetry(body: unknown): Promise<Job> {
 
 const MAX_CONSECUTIVE_POLL_ERRORS = 120;
 
-async function pollUntilTerminal(store: Store, itemId: string, serverId: string, lostJobMessage = "The server lost track of this job."): Promise<void> {
+interface PollOptions {
+	/**
+	 * Skip the initial inter-tick sleep so the first GET happens immediately.
+	 * Only the resume path opts in: a refreshed page re-polls a persisted job that has long been running.
+	 * Same-session polling keeps the sleep, since the server needs a moment right after the POST.
+	 */
+	immediate?: boolean;
+}
+
+async function pollUntilTerminal(store: Store, itemId: string, serverId: string, lostJobMessage = "The server lost track of this job.", options: PollOptions = {}): Promise<void> {
 	let consecutiveErrors = 0;
+	// Delay before the first GET: zero on the immediate (resume) path, otherwise one full poll tick.
+	// Every later iteration sleeps the normal tick, so the inter-tick cadence and error budget are identical on both paths.
+	let firstDelayMs = options.immediate ? 0 : POLL_MS;
 	while (true) {
-		await sleep(POLL_MS);
+		if (firstDelayMs > 0) await sleep(firstDelayMs);
+		firstDelayMs = POLL_MS;
 		// Item was removed from the queue while running (client chose to drop it).
 		if (!store.state.queue.some((i) => i.id === itemId)) return;
 
@@ -145,8 +160,17 @@ async function pollUntilTerminal(store: Store, itemId: string, serverId: string,
 			continue;
 		}
 
-		if (job.started) {
-			store.patchQueueItem(itemId, { startedAt: job.started * 1000 });
+		// A resumed item can still sit at `submitting` (its last persisted state before the refresh) while the
+		// server job is already running. Promote it to `generating` as soon as the server reports the job
+		// running; same-session polling always passes an already-`generating` item, so the promotion only
+		// ever fires on the resume path. The transition also gives the row a rebuild trigger.
+		const item = store.state.queue.find((i) => i.id === itemId);
+		const resuming = item !== undefined && item.status === "submitting" && (job.status === "generating" || job.started != null);
+		if (resuming || job.started) {
+			const patch: Partial<QueueItem> = {};
+			if (resuming) patch.status = "generating";
+			if (job.started) patch.startedAt = job.started * 1000;
+			store.patchQueueItem(itemId, patch);
 		}
 		if (job.status === "generating" && isJobProgress(job.progress)) {
 			store.setQueueProgress(itemId, job.progress);

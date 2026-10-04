@@ -179,7 +179,20 @@ export interface Store {
 	/** Mark a completed history item as viewed (clears its "new" highlight and favicon contribution). */
 	markHistoryViewed(id: string): void;
 	removeHistory(id: string): void;
-	removeOldestHistory(count: number): void;
+	/**
+	 * Delete the `count` oldest history items across the whole persisted archive (residents and evicted archive-only items alike).
+	 * Emits `history` once. Returns the deleted ids.
+	 */
+	removeOldestHistory(count: number): Promise<string[]>;
+	/**
+	 * Delete every history item (resident and archived) strictly older than the epoch-ms cutoff.
+	 * Emits `history` once.
+	 */
+	removeHistoryBefore(cutoffMs: number): Promise<void>;
+	/** Count exactly what removeHistoryBefore would delete (archive-wide when a backend exists). */
+	countHistoryBefore(cutoffMs: number): Promise<number>;
+	/** Count every history item the delete-oldest control acts on: the whole archive union, resident and evicted alike. */
+	countHistory(): Promise<number>;
 	clearHistory(): void;
 	setResident(id: string, preloaded?: Blob): Promise<void>;
 	residentId(): string | null;
@@ -240,13 +253,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 	const queueReady = new Promise<void>((resolve) => {
 		resolveQueueReady = resolve;
 	});
-	// Counts in-memory queue mutations; hydration only applies the loaded snapshot when none happened
-	// while the load was in flight, so a fast user action is never clobbered by a stale read.
-	let queueWrites = 0;
-	// Fixed baseline against which the "no queue mutation happened before load" shield is checked.
-	// It is a hard-coded literal (0), not a snapshot captured at some later moment: the queue starts
-	// life empty, so the load's precondition is exactly `queueWrites === 0`.
-	const NO_QUEUE_WRITES_BEFORE_LOAD = 0;
 	let hadSavedDims = false;
 	const savedDims = readSavedFormDims(storage);
 	if (savedDims) {
@@ -295,9 +301,19 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			state.caps = caps;
 			state.online = true;
 			state.capsError = null;
+			const prevVidProgress = state.vidProgress;
 			state.vidProgress = supportsVideoProgress(caps);
 			state.progressError = state.vidProgress ? null : VIDEO_PROGRESS_ERROR;
 			state.apiBase = getApiBase();
+			// A queue row renders its live progress bar only when vidProgress is known true, and the row's
+			// reconcile signature carries that flag, so a flip must also notify the queue domain: otherwise a
+			// job resumed before the first caps probe would never gain its progress bar (the resumed run's only
+			// other queue mutation, a value-identical startedAt patch, emits nothing).
+			// The flip guard keeps the periodic probe from re-rendering the queue once the flag is already known.
+			if (state.vidProgress !== prevVidProgress) {
+				revs.queue += 1;
+				emit("queue");
+			}
 			emit("caps");
 			const v = caps.defaults_by_mode?.vid_gen;
 			const f = state.form;
@@ -353,7 +369,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		pushQueue: (item) => {
 			state.queue.unshift(item);
 			revs.queue += 1;
-			queueWrites += 1;
 			emit("queue");
 			// Mutate in-memory synchronously (the UI source of truth), persist best-effort in the background.
 			persistQueue();
@@ -363,7 +378,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			if (items.length === 0) return;
 			for (const item of items) state.queue.unshift(item);
 			revs.queue += 1;
-			queueWrites += 1;
 			emit("queue");
 			persistQueue();
 		},
@@ -381,7 +395,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			if (changed) {
 				Object.assign(item, patch);
 				revs.queue += 1;
-				queueWrites += 1;
 				emit("queue");
 				persistQueue();
 			}
@@ -389,8 +402,8 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 		setQueueProgress: (id, progress) => {
 			// In-memory only, by design: it neither bumps the queue revision, persists the queue, nor emits.
 			// Progress is transient; the UI repaints it via its own ticker.
-			// The hydration shield below (queueWrites === NO_QUEUE_WRITES_BEFORE_LOAD) only holds because progress
-			// updates never count as a queue write; keep progress off patchQueueItem or the shield is defeated.
+			// Keeping progress off patchQueueItem is what lets a poll land mid-hydration without disturbing
+			// the hydration merge (the merge only concatenates pushed items with the loaded snapshot).
 			const item = state.queue.find((i) => i.id === id);
 			if (!item) return;
 			// The early-return exists only to skip the no-op of overwriting an identical value.
@@ -404,7 +417,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			if (idx < 0) return;
 			state.queue.splice(idx, 1);
 			revs.queue += 1;
-			queueWrites += 1;
 			emit("queue");
 			persistQueue();
 		},
@@ -415,7 +427,6 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			if (item === undefined) return;
 			q.splice(to, 0, item);
 			revs.queue += 1;
-			queueWrites += 1;
 			persistQueue();
 			emit("queue");
 		},
@@ -432,12 +443,21 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 			if (resident?.id === id) clearResident();
 			emit("history");
 		},
-		removeOldestHistory: (count) => {
-			history.removeOldest(count);
+		removeOldestHistory: async (count) => {
+			const removed = await history.removeOldest(count);
+			const rid = resident?.id ?? null;
+			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
+			emit("history");
+			return removed;
+		},
+		removeHistoryBefore: async (cutoffMs) => {
+			await history.removeBefore(cutoffMs);
 			const rid = resident?.id ?? null;
 			if (rid !== null && !history.items().some((i) => i.id === rid)) clearResident();
 			emit("history");
 		},
+		countHistoryBefore: (cutoffMs) => history.countBefore(cutoffMs),
+		countHistory: () => history.countAll(),
 		clearHistory: () => {
 			history.clear();
 			const rid = resident?.id ?? null;
@@ -479,19 +499,22 @@ export function createStore(queueBackend: QueueBackend = createIdbQueue()): Stor
 	});
 
 	// Hydrate the queue from the persisted backend. The load is best-effort (never throws): when the
-	// backend is unavailable it resolves to an empty queue and the session is queue-only-like-memory.
+	// backend is unavailable it resolves to null and the session is queue-only-like-memory.
 	void (async () => {
 		const loaded = await queueBackend.load().catch(() => null);
-		// Only surface the persisted snapshot if nothing was mutated while it was loading, so an early
-		// user action is never clobbered by a stale read (load is typically faster than user input).
-		// A throwing backend resolves nothing: the session stays in-memory only, exactly like an unavailable backend.
-		// This guard only holds because setQueueProgress deliberately does NOT increment queueWrites: progress
-		// polled mid-hydration must not look like a user mutation or it would discard the loaded snapshot.
-		// Routing progress through patchQueueItem would silently defeat this shield.
-		if (loaded !== null && queueWrites === NO_QUEUE_WRITES_BEFORE_LOAD) {
-			state.queue = loaded;
+		if (loaded !== null) {
+			// Merge instead of discard: the only queue mutations possible while the load was in flight are
+			// pushQueue/pushQueueMany of brand-new items (patch/remove/move are no-ops on an empty array), so
+			// every in-memory item is strictly newer than the snapshot. The locals keep their newest-first
+			// head positions and win id collisions; the loaded snapshot follows.
+			// The immediate persist then closes the gap the merge would otherwise leave: each local push's
+			// own earlier persist ran before hydration and wrote only the locals, so the snapshot items would
+			// be missing from the backend until some future mutation.
+			const localIds = new Set(state.queue.map((i) => i.id));
+			state.queue = [...state.queue, ...loaded.filter((i) => !localIds.has(i.id))];
 			revs.queue += 1;
 			emit("queue");
+			persistQueue();
 		}
 		resolveQueueReady();
 	})();
